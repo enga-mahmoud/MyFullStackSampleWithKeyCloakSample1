@@ -16,6 +16,7 @@ import { KeycloakService } from 'keycloak-angular';
         <a routerLink="/dashboard" routerLinkActive="active">Dashboard</a>
         <a routerLink="/users" routerLinkActive="active">Users</a>
         <a routerLink="/products" routerLinkActive="active">Products</a>
+        <a routerLink="/orders" routerLinkActive="active">Orders</a>
         <a routerLink="/admin" routerLinkActive="active" *ngIf="isAdmin">Admin</a>
       </div>
       <div class="nav-user" *ngIf="isLoggedIn">
