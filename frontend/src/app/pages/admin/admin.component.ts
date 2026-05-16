@@ -1,7 +1,7 @@
 import { Component, OnInit } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ApiService } from '../../services/api.service';
-import { forkJoin } from 'rxjs';
+import { catchError, forkJoin, of } from 'rxjs';
 
 @Component({
   selector: 'app-admin',
@@ -24,6 +24,10 @@ import { forkJoin } from 'rxjs';
           <div style="font-size:2.5rem;font-weight:700;color:#e74c3c;">{{ outOfStock }}</div>
           <div class="text-muted">Out of Stock</div>
         </div>
+        <div class="card" style="text-align:center;">
+          <div style="font-size:2.5rem;font-weight:700;color:#f39c12;">{{ totalOrders }}</div>
+          <div class="text-muted">Total Orders</div>
+        </div>
       </div>
 
       <div class="card">
@@ -34,6 +38,7 @@ import { forkJoin } from 'rxjs';
           <a href="http://localhost:9090" target="_blank" class="btn btn-outline">Prometheus</a>
           <a href="http://localhost:8888/actuator" target="_blank" class="btn btn-outline">Config Server</a>
           <a href="http://localhost:8090/actuator/gateway/routes" target="_blank" class="btn btn-outline">Gateway Routes</a>
+          <a href="http://localhost:8083/actuator/health" target="_blank" class="btn btn-outline">Order Service</a>
         </div>
       </div>
 
@@ -53,6 +58,10 @@ import { forkJoin } from 'rxjs';
             <span class="badge badge-user">:8082</span>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span>Order Service</span>
+            <span class="badge badge-user">:8083</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
             <span>Config Server</span>
             <span class="badge badge-user">:8888</span>
           </div>
@@ -69,6 +78,7 @@ export class AdminComponent implements OnInit {
   totalUsers = 0;
   totalProducts = 0;
   outOfStock = 0;
+  totalOrders = 0;
 
   constructor(private api: ApiService) {}
 
@@ -76,11 +86,13 @@ export class AdminComponent implements OnInit {
     forkJoin({
       users: this.api.getUsers(),
       products: this.api.getProducts(),
+      orders: this.api.getOrders().pipe(catchError(() => of([]))),
     }).subscribe({
-      next: ({ users, products }) => {
+      next: ({ users, products, orders }) => {
         this.totalUsers = users.length;
         this.totalProducts = products.length;
         this.outOfStock = products.filter((p) => p.stock === 0).length;
+        this.totalOrders = orders.length;
       },
     });
   }

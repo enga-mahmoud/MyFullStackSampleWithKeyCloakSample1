@@ -7,12 +7,13 @@ import { KeycloakAngularModule, KeycloakService } from 'keycloak-angular';
 import { AppComponent } from './app/app.component';
 import { routes } from './app/app.routes';
 import { authInterceptor } from './app/interceptors/auth.interceptor';
+import { environment } from './environments/environment';
 
 function initializeKeycloak(keycloak: KeycloakService) {
   return () =>
     keycloak.init({
       config: {
-        url: 'http://localhost:8080',
+        url: environment.keycloakUrl,
         realm: 'myapp-realm',
         clientId: 'angular-client',
       },

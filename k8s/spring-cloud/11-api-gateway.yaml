@@ -40,18 +40,13 @@ spec:
           ports:
             - containerPort: 8090
           env:
-            - name: SPRING_CLOUD_CONFIG_URI
+            - name: CONFIG_SERVER_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: config-server-secret
                   key: CONFIG_SERVER_PASSWORD
             - name: SPRING_CLOUD_CONFIG_URI
               value: "http://configuser:$(CONFIG_SERVER_PASSWORD)@config-server:8888"
-            - name: CONFIG_SERVER_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: config-server-secret
-                  key: CONFIG_SERVER_PASSWORD
             - name: KEYCLOAK_ISSUER_URI
               value: "http://keycloak:8080/realms/myapp-realm"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT

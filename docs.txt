@@ -13,27 +13,31 @@ Each entry explains what the file is, why it exists, and what it does.
 =====================================================================
 
 docker-compose.yml
-  PURPOSE : Master orchestration file that defines and wires all 14
+  PURPOSE : Master orchestration file that defines and wires all 15
             Docker containers together into a single deployable stack.
   WHAT IT DOES :
     - Declares a shared Docker network (app-network) so every container
       can reach others by service name (e.g. "keycloak", "loki").
-    - Declares 7 named volumes for persistent data (postgres databases,
+    - Declares 8 named volumes for persistent data (postgres databases,
       prometheus metrics, loki logs, tempo traces, grafana dashboards).
-    - Defines all 14 services with their images, environment variables,
+    - Defines all 15 services with their images, environment variables,
       port mappings, health checks, startup dependencies, and restart
       policies.
     - Enforces startup order: databases become healthy before Keycloak
       starts; Keycloak becomes healthy before api-gateway and
       microservices start; config-server becomes healthy before all
       Spring Boot apps start.
+    - order-service additionally depends on user-service and
+      product-service being started (service_started condition).
 
 .env
   PURPOSE : Central store for all secrets and configurable values used
             by docker-compose.yml.
   WHAT IT DOES :
     - Holds passwords for Keycloak admin, Keycloak DB, user-service DB,
-      product-service DB, Config Server, and Grafana.
+      product-service DB, order-service DB (ORDER_DB_PASSWORD), the
+      order-service Keycloak client secret (ORDER_SERVICE_CLIENT_SECRET),
+      Config Server, and Grafana.
     - Docker Compose reads this file automatically and substitutes
       ${VARIABLE} placeholders in docker-compose.yml.
     - Keeps secrets out of docker-compose.yml so it is safe to commit
@@ -252,10 +256,11 @@ api-gateway/src/main/resources/application.yml
       the correct Keycloak realm's JWKS endpoint.
     - Defines global CORS policy allowing requests from http://localhost:4200
       (the Angular app) with all HTTP methods and Authorization header.
-    - Defines two routes:
-        /api/users/**  → forwards to http://user-service:8081
+    - Defines three routes:
+        /api/users/**   → forwards to http://user-service:8081
         /api/products/** → forwards to http://product-service:8082
-    - Applies the TokenRelay= filter on both routes, which copies the
+        /api/orders/**  → forwards to http://order-service:8083
+    - Applies the TokenRelay= filter on all routes, which copies the
       incoming Authorization: Bearer <JWT> header to the downstream request.
     - Configures OTel exporter endpoint for trace export.
 
@@ -425,7 +430,7 @@ user-service/src/main/java/.../config/SecurityConfig.java
   CONCEPT: Session Management — IF_REQUIRED + NullSecurityContextRepository
 ---------------------------------------------------------------------
 
-  THE CONFIGURATION IN CODE (user-service and product-service) :
+  THE CONFIGURATION IN CODE (user-service, product-service, and order-service) :
       .sessionManagement(session ->
           session.sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED))
       .securityContext(ctx ->
@@ -550,9 +555,10 @@ user-service/src/main/java/.../config/SecurityConfig.java
     reconstructs the ReactiveSecurityContext from the JWT on each request
     without touching a WebSession. Therefore no sessionManagement() or
     securityContext() override is needed in the gateway; these settings
-    only apply to the Servlet-based microservices (user-service and
-    product-service) where IF_REQUIRED is the default and would otherwise
-    cause Spring Security to cache the SecurityContext in the session.
+    only apply to the Servlet-based microservices (user-service,
+    product-service, and order-service) where IF_REQUIRED is the
+    default and would otherwise cause Spring Security to cache the
+    SecurityContext in the session.
 
 user-service/src/main/java/.../config/ExceptionHandler.java
   PURPOSE : Global exception handler that converts exceptions to HTTP responses.
@@ -1162,7 +1168,11 @@ frontend/angular.json
     - Configures the build architect using @angular-devkit/build-angular.
     - Sets the output path (dist/frontend), entry point (main.ts),
       global stylesheet (styles.css), and asset directory.
-    - Defines production and development build configurations.
+    - Defines production build configuration with a fileReplacements rule
+      that swaps environment.ts → environment.prod.ts so the Keycloak URL
+      is environment-specific without maintaining separate builds.
+    - Defines development build configuration with source maps and no
+      optimisation.
     - Configures the dev server to use proxy.conf.json (so /api requests
       are forwarded to the API Gateway during local development without CORS).
 
@@ -1238,6 +1248,23 @@ frontend/src/styles.css
     - All page components use these shared classes instead of duplicating
       CSS, keeping component stylesheets minimal.
 
+frontend/src/environments/environment.ts
+  PURPOSE : Development-time environment variables for the Angular build.
+  WHAT IT DOES :
+    - Exports { production: false, keycloakUrl: 'http://localhost:8080' }.
+    - Used when running ng serve or building without --configuration production.
+    - Points to the locally exposed Keycloak Docker Compose port.
+
+frontend/src/environments/environment.prod.ts
+  PURPOSE : Production environment variables swapped in during the
+            production build via angular.json fileReplacements.
+  WHAT IT DOES :
+    - Exports { production: true, keycloakUrl: 'http://keycloak.local' }.
+    - Used when building with ng build --configuration production
+      (the default in the Dockerfile).
+    - Points to the Keycloak Ingress hostname used in Kubernetes so the
+      browser can reach Keycloak without knowing any internal IP or port.
+
 frontend/src/main.ts
   PURPOSE : Angular application bootstrap entry point.
   WHAT IT DOES :
@@ -1248,6 +1275,10 @@ frontend/src/main.ts
     - Provides provideRouter with the route table defined in app.routes.ts.
     - Imports KeycloakAngularModule and registers an APP_INITIALIZER that
       calls keycloak.init() before Angular renders any component.
+    - Reads environment.keycloakUrl for the Keycloak server URL so the
+      same build artefact does not need to be rebuilt for each environment
+      (the production build already has the correct URL baked in via
+      environment.prod.ts).
     - The Keycloak init uses onLoad: 'check-sso' (silently checks if the
       user is already logged in without forcing a redirect) and points to
       the silent-check-sso.html page for iframe-based session detection.
@@ -1314,15 +1345,20 @@ frontend/src/app/guards/auth.guard.ts
 frontend/src/app/services/api.service.ts
   PURPOSE : Centralised HTTP client service for all backend API calls.
   WHAT IT DOES :
-    - Defines TypeScript interfaces User and Product matching the JSON
-      shapes returned by the Spring Boot microservices.
+    - Defines TypeScript interfaces User, Product, Order, and
+      CreateOrderRequest matching the JSON shapes returned by the Spring
+      Boot microservices.
     - Provides methods: getUsers, getUser, createUser, updateUser,
       deleteUser, getProducts, getProduct, createProduct, updateProduct,
-      deleteProduct.
+      deleteProduct, getOrders, getOrdersByUser, createOrder.
     - All methods call HttpClient which automatically passes through the
       authInterceptor, so tokens are attached without any extra code.
-    - Uses relative URLs (/api/users, /api/products) which are proxied
-      to the API Gateway by either proxy.conf.json (dev) or nginx.conf (Docker).
+    - Uses relative URLs (/api/users, /api/products, /api/orders) which
+      are proxied to the API Gateway by either proxy.conf.json (dev) or
+      nginx.conf (Docker).
+    - Order interface fields: id, userId, productId, quantity, totalPrice,
+      status ('CONFIRMED' | 'FAILED'), createdAt.
+    - CreateOrderRequest: userId, productId, quantity.
 
 ---------------------------------------------------------------------
   src/app/components/
@@ -1332,8 +1368,8 @@ frontend/src/app/components/navbar/navbar.component.ts
   PURPOSE : Navigation bar shown at the top of every page.
   WHAT IT DOES :
     - Displays the app brand name "MyApp".
-    - Shows navigation links: Dashboard, Users, Products; Admin link is
-      conditionally shown only when isAdmin is true.
+    - Shows navigation links: Dashboard, Users, Products, Orders; Admin
+      link is conditionally shown only when isAdmin is true.
     - Shows the logged-in username and a role badge (Admin/User).
     - Provides Login button when not authenticated, Logout button when
       authenticated (calls keycloak.logout() which redirects to Keycloak
@@ -1349,8 +1385,8 @@ frontend/src/app/pages/dashboard/dashboard.component.ts
   PURPOSE : Landing page for authenticated users.
   WHAT IT DOES :
     - Greets the user by name and displays their roles.
-    - Shows navigation cards to Users, Products, and (conditionally)
-      Admin pages.
+    - Shows navigation cards to Users, Products, Orders, and
+      (conditionally) Admin pages.
     - Displays a "Token Info" card showing username, email, and all roles
       parsed directly from the Keycloak JWT — useful for debugging auth.
     - Calls keycloak.loadUserProfile() to fetch the email from the
@@ -1377,15 +1413,40 @@ frontend/src/app/pages/products/products.component.ts
     - Admin users can create, edit, and delete products via a modal form
       with name, description, price, and stock fields.
 
+frontend/src/app/pages/orders/orders.component.ts
+  PURPOSE : Order management page — browse existing orders and place new ones.
+  WHAT IT DOES :
+    - Admin role: loads all orders via getOrders(); also fetches all users
+      and all products to build lookup maps so the table shows usernames
+      and product names instead of raw IDs.
+    - Regular user (ROLE_USER): resolves the logged-in user's database ID
+      by matching keycloak.getUsername() against the /api/users list, then
+      loads only that user's orders via getOrdersByUser(id). Shows an info
+      banner when no matching DB profile is found.
+    - Displays orders in a table with columns: ID, User, Product, Quantity,
+      Total Price, Status, Created date. Status shown as a green badge
+      (CONFIRMED) or red badge (FAILED).
+    - Place Order button opens a modal form with a product dropdown
+      (filtered to in-stock products only), quantity input, and inline
+      error display for upstream failures.
+    - Submits POST /api/orders via ApiService.createOrder() and refreshes
+      the list on success.
+    - Route: /orders, protected by authGuard with data: { roles: ['ROLE_USER'] }.
+
 frontend/src/app/pages/admin/admin.component.ts
   PURPOSE : Administrator-only dashboard with system stats and quick links.
   WHAT IT DOES :
     - Only reachable by users with ROLE_ADMIN (enforced by authGuard).
-    - Calls both getUsers() and getProducts() in parallel using RxJS forkJoin.
-    - Displays stat cards: total users, total products, out-of-stock count.
+    - Calls getUsers(), getProducts(), and getOrders() in parallel using
+      RxJS forkJoin (catchError wraps each call so a single service outage
+      does not break the whole page).
+    - Displays stat cards: total users, total products, out-of-stock count,
+      total orders.
     - Provides quick-link buttons to: Keycloak Admin Console, Grafana,
-      Prometheus, Config Server actuator, API Gateway routes actuator.
-    - Lists all backend services with their ports for quick reference.
+      Prometheus, Config Server actuator, API Gateway routes actuator,
+      Order Service actuator health.
+    - Lists all backend services with their ports for quick reference,
+      including order-service on :8083.
 
 
 =====================================================================
@@ -1411,6 +1472,27 @@ REQUEST FLOW (happy path):
   16. Response flows back: product-service → gateway → nginx → Angular.
   17. ProductsComponent renders the product table.
 
+ORDER PLACEMENT FLOW (service-to-service):
+  1. User opens /orders, clicks "Place Order", selects product + quantity.
+  2. OrdersComponent calls ApiService.createOrder() → POST /api/orders.
+  3. authInterceptor attaches the user's JWT; nginx proxies to api-gateway.
+  4. API Gateway validates JWT and routes to order-service:8083/api/orders.
+  5. order-service validates the user JWT (defense in depth).
+  6. @PreAuthorize("hasRole('USER')") passes.
+  7. OrderService calls user-service to verify the user exists:
+     - Uses AuthorizedClientServiceOAuth2AuthorizedClientManager to obtain
+       a client_credentials token for order-service-client from Keycloak.
+     - Calls GET http://user-service:8081/api/users/{userId} with Bearer
+       token (service account token, not the user's token).
+  8. OrderService calls product-service to fetch product + check stock:
+     - Same client_credentials token reused (cached by OAuth2AuthorizedClientService).
+     - Calls GET http://product-service:8082/api/products/{productId}.
+  9. If user exists, product exists, and stock >= quantity:
+     - order-service calls PUT /api/products/{id} (admin scope) to decrement stock.
+     - Creates order record in postgres-order with status CONFIRMED.
+  10. If any check fails: order is saved with status FAILED.
+  11. OrderResponse JSON returned to Angular; OrdersComponent refreshes list.
+
 OBSERVABILITY FLOW:
   - Every Spring Boot service creates a trace span per HTTP request.
   - Micrometer OTel bridge sends spans via gRPC to otel-collector:4317.
@@ -1422,9 +1504,9 @@ OBSERVABILITY FLOW:
 
 CONFIGURATION FLOW:
   - Config Server starts and mounts config-repo/ as a volume.
-  - api-gateway, user-service, product-service each call Config Server
-    at startup: GET /user-service/default → returns merged application.yml
-    + user-service.yml properties.
+  - api-gateway, user-service, product-service, order-service each call
+    Config Server at startup: GET /<service-name>/default → returns merged
+    application.yml + <service-name>.yml properties.
   - Services use these remote properties alongside their own
     application.yml (local values override remote values).
 =====================================================================
@@ -1435,7 +1517,7 @@ CONFIGURATION FLOW:
 =====================================================================
 
   The k8s/ directory contains all Kubernetes manifests to run the
-  same 14-service stack in a Kubernetes cluster instead of Docker
+  same 15-service stack in a Kubernetes cluster instead of Docker
   Compose. Files are numbered in dependency order and grouped into
   sub-directories by concern. All resources live in the "myapp"
   namespace.
@@ -1461,7 +1543,8 @@ CONFIGURATION FLOW:
     ├── databases/
     │   ├── 06-postgres-keycloak.yaml
     │   ├── 07-postgres-user.yaml
-    │   └── 08-postgres-product.yaml
+    │   ├── 08-postgres-product.yaml
+    │   └── 09-postgres-order.yaml
     ├── auth/
     │   └── 09-keycloak.yaml
     ├── spring-cloud/
@@ -1469,7 +1552,8 @@ CONFIGURATION FLOW:
     │   └── 11-api-gateway.yaml
     ├── microservices/
     │   ├── 12-user-service.yaml
-    │   └── 13-product-service.yaml
+    │   ├── 13-product-service.yaml
+    │   └── 14-order-service.yaml
     ├── observability/
     │   ├── 14-otel-collector.yaml
     │   ├── 15-prometheus.yaml
@@ -1518,13 +1602,16 @@ k8s/01-secrets.yaml
   WHAT IT DOES :
     - Uses stringData (plaintext) which Kubernetes base64-encodes
       automatically when storing in etcd.
-    - Creates 6 separate Secret objects, one per concern, following
+    - Creates 8 separate Secret objects, one per concern, following
       the principle of least privilege (each Pod only mounts the
       secret it needs):
         keycloak-db-secret     : KC_DB_PASSWORD
         keycloak-admin-secret  : KEYCLOAK_ADMIN + KEYCLOAK_ADMIN_PASSWORD
         user-db-secret         : USER_DB_PASSWORD
         product-db-secret      : PRODUCT_DB_PASSWORD
+        order-db-secret        : ORDER_DB_PASSWORD
+        order-client-secret    : ORDER_SERVICE_CLIENT_SECRET (Keycloak
+                                  client_credentials secret for order-service)
         config-server-secret   : CONFIG_SERVER_PASSWORD
         grafana-secret         : GF_SECURITY_ADMIN_PASSWORD
     - Pods consume these via secretKeyRef in their env sections so
@@ -1540,7 +1627,8 @@ k8s/configmaps/02-config-repo-cm.yaml
             from the host.
   WHAT IT DOES :
     - Contains application.yml (shared config for all services),
-      user-service.yml, and product-service.yml as ConfigMap data keys.
+      user-service.yml, product-service.yml, and order-service.yml as
+      ConfigMap data keys.
     - Mounted into the config-server container at /config-repo.
     - In Docker Compose the host directory is bind-mounted; in K8s this
       ConfigMap replaces that bind-mount, making the deployment portable.
@@ -1582,10 +1670,11 @@ k8s/configmaps/04-keycloak-realm-cm.yaml
 k8s/storage/05-pvcs.yaml
   PURPOSE : Declares PersistentVolumeClaims for all stateful services.
   WHAT IT DOES :
-    - Creates 7 PVCs (ReadWriteOnce, one per stateful service):
+    - Creates 8 PVCs (ReadWriteOnce, one per stateful service):
         postgres-keycloak-pvc  2Gi  — Keycloak database
         postgres-user-pvc      2Gi  — User service database
         postgres-product-pvc   2Gi  — Product service database
+        postgres-order-pvc     2Gi  — Order service database
         prometheus-pvc         5Gi  — Prometheus TSDB
         loki-pvc               5Gi  — Loki log chunks
         tempo-pvc              5Gi  — Tempo trace blocks
@@ -1627,6 +1716,14 @@ k8s/databases/08-postgres-product.yaml
     - Database: productdb, user: productservice.
     - Password from product-db-secret.
     - Mounted on postgres-product-pvc.
+
+k8s/databases/09-postgres-order.yaml
+  PURPOSE : Deploys the dedicated PostgreSQL database for order-service.
+  WHAT IT DOES :
+    - Same StatefulSet pattern as the other Postgres instances.
+    - Database: orderdb, user: orderservice.
+    - Password from order-db-secret.
+    - Mounted on postgres-order-pvc.
 
 ---------------------------------------------------------------------
   k8s/auth/
@@ -1702,6 +1799,23 @@ k8s/microservices/13-product-service.yaml
     - Identical structure to user-service.yaml.
     - Points at postgres-product:5432/productdb.
     - ClusterIP Service on port 8082.
+
+k8s/microservices/14-order-service.yaml
+  PURPOSE : Deploys the order-service microservice.
+  WHAT IT DOES :
+    - Three initContainers ensure startup ordering:
+        wait-for-postgres-order: polls nc -z postgres-order 5432.
+        wait-for-config-server: polls /actuator/health.
+        wait-for-keycloak: polls Keycloak /health/ready.
+    - Reads DB password from order-db-secret and client secret from
+      order-client-secret.
+    - Sets SPRING_DATASOURCE_URL to postgres-order:5432/orderdb.
+    - Sets SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_ISSUER_URI
+      and CLIENT_SECRET so the order-service can obtain client_credentials
+      tokens from Keycloak for service-to-service calls.
+    - Sets USER_SERVICE_URL and PRODUCT_SERVICE_URL to the in-cluster
+      service names (user-service:8081 and product-service:8082).
+    - ClusterIP Service on port 8083.
 
 ---------------------------------------------------------------------
   k8s/observability/
@@ -1801,14 +1915,16 @@ k8s/20-ingress.yaml
 
 STARTUP ORDER (enforced by initContainers and probe ordering):
   1. Namespace, Secrets, ConfigMaps, PVCs created (no Pods yet)
-  2. postgres-keycloak, postgres-user, postgres-product StatefulSets start
-     — readinessProbe pg_isready gates all dependents
+  2. postgres-keycloak, postgres-user, postgres-product, postgres-order
+     StatefulSets start — readinessProbe pg_isready gates all dependents
   3. keycloak Deployment starts (initContainer waits for postgres-keycloak)
      — readinessProbe /health/ready gates config-server, gateways
   4. config-server Deployment starts (standalone, no DB dependency)
      — readinessProbe /actuator/health gates all Spring Boot apps
-  5. api-gateway, user-service, product-service start in parallel
-     (each has initContainers waiting for config-server + their DB/keycloak)
+  5. api-gateway, user-service, product-service, order-service start
+     in parallel (each has initContainers waiting for config-server +
+     their DB/keycloak; order-service also needs user-service and
+     product-service to be reachable for runtime calls)
   6. observability stack starts in parallel (no strong ordering needed)
   7. frontend starts (depends on api-gateway being reachable for nginx proxy)
   8. Ingress routes external traffic to frontend, keycloak, grafana
@@ -1825,18 +1941,20 @@ DNS RESOLUTION IN-CLUSTER:
     loki               → http://loki:3100/loki/api/v1/push
 
 CUSTOM IMAGE BUILD PROCESS:
-  Before deploying to K8s, build and load the four custom images:
-    docker build -t myapp/config-server:1.0.0  ./config-server
-    docker build -t myapp/api-gateway:1.0.0    ./api-gateway
-    docker build -t myapp/user-service:1.0.0   ./user-service
-    docker build -t myapp/product-service:1.0.0 ./product-service
-    docker build -t myapp/frontend:1.0.0        ./frontend
+  Before deploying to K8s, build and load the five custom images:
+    docker build -t myapp/config-server:1.0.0   ./config-server
+    docker build -t myapp/api-gateway:1.0.0     ./api-gateway
+    docker build -t myapp/user-service:1.0.0    ./user-service
+    docker build -t myapp/product-service:1.0.0  ./product-service
+    docker build -t myapp/order-service:1.0.0    ./order-service
+    docker build -t myapp/frontend:1.0.0         ./frontend
 
   For minikube (no registry needed):
     minikube image load myapp/config-server:1.0.0
     minikube image load myapp/api-gateway:1.0.0
     minikube image load myapp/user-service:1.0.0
     minikube image load myapp/product-service:1.0.0
+    minikube image load myapp/order-service:1.0.0
     minikube image load myapp/frontend:1.0.0
 
   For a remote registry (Docker Hub, ECR, GCR):

@@ -27,6 +27,11 @@ import { KeycloakService } from 'keycloak-angular';
           <h3>Products</h3>
           <p class="text-muted">Browse and manage products</p>
         </a>
+        <a routerLink="/orders" class="card" style="text-decoration:none;color:inherit;cursor:pointer;">
+          <div style="font-size:2rem;margin-bottom:0.5rem;">🛒</div>
+          <h3>Orders</h3>
+          <p class="text-muted">Place and track orders</p>
+        </a>
         <a routerLink="/admin" *ngIf="isAdmin" class="card" style="text-decoration:none;color:inherit;cursor:pointer;">
           <div style="font-size:2rem;margin-bottom:0.5rem;">⚙️</div>
           <h3>Admin Panel</h3>

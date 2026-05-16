@@ -12,7 +12,6 @@ metadata:
   name: myapp-ingress
   namespace: myapp
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
 spec:

@@ -48,11 +48,13 @@ data:
           "serviceAccountsEnabled": false,
           "redirectUris": [
             "http://localhost:4200/*",
-            "http://frontend/*"
+            "http://frontend/*",
+            "http://myapp.local/*"
           ],
           "webOrigins": [
             "http://localhost:4200",
-            "http://frontend"
+            "http://frontend",
+            "http://myapp.local"
           ],
           "attributes": {
             "pkce.code.challenge.method": "S256"

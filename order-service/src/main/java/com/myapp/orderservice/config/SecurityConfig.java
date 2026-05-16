@@ -24,6 +24,9 @@ public class SecurityConfig {
         return http
                 .csrf(csrf -> csrf.disable())
                 .sessionManagement(session ->
+                        // IF_REQUIRED lets Tomcat create an HttpSession for application data.
+                        // NullSecurityContextRepository ensures the SecurityContext is never
+                        // stored in the session — JWT Bearer token is still required on every request.
                         session.sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED))
                 .securityContext(ctx ->
                         ctx.securityContextRepository(new NullSecurityContextRepository()))
