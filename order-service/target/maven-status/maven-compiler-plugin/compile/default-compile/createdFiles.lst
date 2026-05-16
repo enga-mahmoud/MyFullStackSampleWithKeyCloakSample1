@@ -1,0 +1,16 @@
+com\myapp\orderservice\model\Order.class
+com\myapp\orderservice\exception\InsufficientStockException.class
+com\myapp\orderservice\service\OrderService.class
+com\myapp\orderservice\client\ProductServiceClient.class
+com\myapp\orderservice\client\UserServiceClient.class
+com\myapp\orderservice\config\SecurityConfig.class
+com\myapp\orderservice\dto\ProductDto.class
+com\myapp\orderservice\repository\OrderRepository.class
+com\myapp\orderservice\client\ServiceTokenProvider.class
+com\myapp\orderservice\model\OrderStatus.class
+com\myapp\orderservice\dto\UserDto.class
+com\myapp\orderservice\controller\OrderController.class
+com\myapp\orderservice\OrderServiceApplication.class
+com\myapp\orderservice\config\WebClientConfig.class
+com\myapp\orderservice\config\GlobalExceptionHandler.class
+com\myapp\orderservice\dto\CreateOrderRequest.class

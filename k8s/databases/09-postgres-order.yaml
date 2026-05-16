@@ -1,0 +1,70 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-order
+  namespace: myapp
+spec:
+  serviceName: postgres-order
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-order
+  template:
+    metadata:
+      labels:
+        app: postgres-order
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: orderdb
+            - name: POSTGRES_USER
+              value: orderservice
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: order-db-secret
+                  key: ORDER_DB_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "orderservice"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "orderservice"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-order-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-order
+  namespace: myapp
+spec:
+  selector:
+    app: postgres-order
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None

@@ -1,0 +1,97 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+  namespace: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: product-service
+  template:
+    metadata:
+      labels:
+        app: product-service
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgres-product 5432; do
+                echo "Waiting for postgres-product..."; sleep 3;
+              done
+        - name: wait-for-config-server
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://config-server:8888/actuator/health 2>/dev/null | grep -q UP; do
+                echo "Waiting for config-server..."; sleep 5;
+              done
+      containers:
+        - name: product-service
+          image: myapp/product-service:1.0.0   # build: docker build -t myapp/product-service:1.0.0 ./product-service
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8082
+          env:
+            - name: CONFIG_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-secret
+                  key: CONFIG_SERVER_PASSWORD
+            - name: SPRING_CLOUD_CONFIG_URI
+              value: "http://configuser:$(CONFIG_SERVER_PASSWORD)@config-server:8888"
+            - name: SPRING_DATASOURCE_URL
+              value: "jdbc:postgresql://postgres-product:5432/productdb"
+            - name: SPRING_DATASOURCE_USERNAME
+              value: productservice
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: product-db-secret
+                  key: PRODUCT_DB_PASSWORD
+            - name: KEYCLOAK_ISSUER_URI
+              value: "http://keycloak:8080/realms/myapp-realm"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4317"
+            - name: LOKI_URL
+              value: "http://loki:3100"
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8082
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 150m
+              memory: 384Mi
+            limits:
+              cpu: 600m
+              memory: 768Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+  namespace: myapp
+spec:
+  selector:
+    app: product-service
+  ports:
+    - port: 8082
+      targetPort: 8082
+  type: ClusterIP

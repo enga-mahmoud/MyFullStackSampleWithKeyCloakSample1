@@ -1,0 +1,7 @@
+com\myapp\userservice\UserServiceApplication.class
+com\myapp\userservice\config\SecurityConfig.class
+com\myapp\userservice\controller\UserController.class
+com\myapp\userservice\service\UserService.class
+com\myapp\userservice\repository\UserRepository.class
+com\myapp\userservice\config\GlobalExceptionHandler.class
+com\myapp\userservice\model\User.class

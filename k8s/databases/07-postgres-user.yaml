@@ -1,0 +1,70 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-user
+  namespace: myapp
+spec:
+  serviceName: postgres-user
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-user
+  template:
+    metadata:
+      labels:
+        app: postgres-user
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: userdb
+            - name: POSTGRES_USER
+              value: userservice
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: user-db-secret
+                  key: USER_DB_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "userservice"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "userservice"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-user-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-user
+  namespace: myapp
+spec:
+  selector:
+    app: postgres-user
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None

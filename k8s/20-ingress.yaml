@@ -1,0 +1,62 @@
+# Requires an Ingress Controller in the cluster.
+# For minikube: minikube addons enable ingress
+# For kind:     apply the nginx-ingress controller manifest
+#
+# After applying, add these entries to your /etc/hosts (or C:\Windows\System32\drivers\etc\hosts):
+#   127.0.0.1  myapp.local keycloak.local grafana.local
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-ingress
+  namespace: myapp
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    # Angular Frontend
+    - host: myapp.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8090
+
+    # Keycloak Admin Console
+    - host: keycloak.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+
+    # Grafana Dashboard
+    - host: grafana.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000

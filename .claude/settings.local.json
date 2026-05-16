@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "PowerShell(Get-ChildItem -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\" -Recurse -Force | Select-Object FullName | ForEach-Object { $_.FullName -replace [regex]::Escape\\(\"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\"\\), \".\" } | Sort-Object)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Test-Path *)",
+      "Bash(Rename-Item *)",
+      "PowerShell(Rename-Item *)",
+      "Bash(Select-String -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\" -Pattern \"^={3,}|^## |^### \")",
+      "Bash(Select-Object LineNumber, Line)",
+      "Bash(Format-Table -AutoSize)"
+    ]
+  }
+}

@@ -1,0 +1,154 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+  namespace: myapp
+data:
+  realm-export.json: |
+    {
+      "realm": "myapp-realm",
+      "displayName": "MyApp Realm",
+      "enabled": true,
+      "sslRequired": "none",
+      "registrationAllowed": false,
+      "loginWithEmailAllowed": true,
+      "duplicateEmailsAllowed": false,
+      "resetPasswordAllowed": true,
+      "editUsernameAllowed": false,
+      "bruteForceProtected": true,
+      "accessTokenLifespan": 300,
+      "ssoSessionIdleTimeout": 1800,
+      "ssoSessionMaxLifespan": 36000,
+      "roles": {
+        "realm": [
+          {
+            "name": "ROLE_USER",
+            "description": "Standard user role",
+            "composite": false,
+            "clientRole": false
+          },
+          {
+            "name": "ROLE_ADMIN",
+            "description": "Administrator role",
+            "composite": false,
+            "clientRole": false
+          }
+        ]
+      },
+      "clients": [
+        {
+          "clientId": "angular-client",
+          "name": "Angular Frontend Client",
+          "enabled": true,
+          "clientAuthenticatorType": "client-secret",
+          "publicClient": true,
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": true,
+          "serviceAccountsEnabled": false,
+          "redirectUris": [
+            "http://localhost:4200/*",
+            "http://frontend/*"
+          ],
+          "webOrigins": [
+            "http://localhost:4200",
+            "http://frontend"
+          ],
+          "attributes": {
+            "pkce.code.challenge.method": "S256"
+          },
+          "protocolMappers": [
+            {
+              "name": "realm-roles-mapper",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-realm-role-mapper",
+              "consentRequired": false,
+              "config": {
+                "multivalued": "true",
+                "userinfo.token.claim": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "claim.name": "roles",
+                "jsonType.label": "String"
+              }
+            }
+          ]
+        },
+        {
+          "clientId": "api-gateway",
+          "name": "API Gateway Client",
+          "enabled": true,
+          "clientAuthenticatorType": "client-secret",
+          "secret": "api-gateway-secret",
+          "publicClient": false,
+          "standardFlowEnabled": false,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": true,
+          "bearerOnly": true
+        }
+      ],
+      "users": [
+        {
+          "username": "user1",
+          "email": "user1@myapp.com",
+          "firstName": "Regular",
+          "lastName": "User",
+          "enabled": true,
+          "emailVerified": true,
+          "credentials": [
+            {
+              "type": "password",
+              "value": "User@1234!",
+              "temporary": false
+            }
+          ],
+          "realmRoles": ["ROLE_USER"]
+        },
+        {
+          "username": "admin1",
+          "email": "admin1@myapp.com",
+          "firstName": "Admin",
+          "lastName": "User",
+          "enabled": true,
+          "emailVerified": true,
+          "credentials": [
+            {
+              "type": "password",
+              "value": "Admin@1234!",
+              "temporary": false
+            }
+          ],
+          "realmRoles": ["ROLE_USER", "ROLE_ADMIN"]
+        }
+      ],
+      "clientScopes": [
+        {
+          "name": "roles",
+          "description": "Realm and client roles scope",
+          "protocol": "openid-connect",
+          "attributes": {
+            "include.in.token.scope": "true",
+            "display.on.consent.screen": "true"
+          },
+          "protocolMappers": [
+            {
+              "name": "realm roles",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-realm-role-mapper",
+              "consentRequired": false,
+              "config": {
+                "multivalued": "true",
+                "userinfo.token.claim": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "claim.name": "roles",
+                "jsonType.label": "String"
+              }
+            }
+          ]
+        }
+      ],
+      "defaultDefaultClientScopes": ["web-origins", "profile", "roles", "email"],
+      "defaultOptionalClientScopes": ["offline_access", "address", "phone"]
+    }

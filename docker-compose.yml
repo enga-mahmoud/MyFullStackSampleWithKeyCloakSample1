@@ -1,0 +1,345 @@
+version: '3.8'
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_keycloak_data:
+  postgres_user_data:
+  postgres_product_data:
+  postgres_order_data:
+  prometheus_data:
+  loki_data:
+  tempo_data:
+  grafana_data:
+
+services:
+
+  # ─── DATABASES ────────────────────────────────────────────────────────────────
+
+  postgres-keycloak:
+    image: postgres:16-alpine
+    container_name: postgres-keycloak
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD}
+    volumes:
+      - postgres_keycloak_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks: [app-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres-user:
+    image: postgres:16-alpine
+    container_name: postgres-user
+    environment:
+      POSTGRES_DB: userdb
+      POSTGRES_USER: userservice
+      POSTGRES_PASSWORD: ${USER_DB_PASSWORD}
+    volumes:
+      - postgres_user_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks: [app-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U userservice"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres-product:
+    image: postgres:16-alpine
+    container_name: postgres-product
+    environment:
+      POSTGRES_DB: productdb
+      POSTGRES_USER: productservice
+      POSTGRES_PASSWORD: ${PRODUCT_DB_PASSWORD}
+    volumes:
+      - postgres_product_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks: [app-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U productservice"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres-order:
+    image: postgres:16-alpine
+    container_name: postgres-order
+    environment:
+      POSTGRES_DB: orderdb
+      POSTGRES_USER: orderservice
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD}
+    volumes:
+      - postgres_order_data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    networks: [app-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderservice"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── KEYCLOAK (PRODUCTION MODE) ───────────────────────────────────────────────
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.4
+    container_name: keycloak
+    command:
+      - start
+      - --import-realm
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres-keycloak:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: 8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    volumes:
+      - ./infrastructure/keycloak:/opt/keycloak/data/import
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres-keycloak:
+        condition: service_healthy
+    networks: [app-network]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
+  # ─── OBSERVABILITY STACK ──────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [app-network]
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./infrastructure/loki/loki-config.yaml:/etc/loki/loki-config.yaml
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks: [app-network]
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./infrastructure/tempo/tempo.yaml:/etc/tempo.yaml
+      - tempo_data:/var/tempo
+    ports:
+      - "3110:3100"
+      - "4319:4317"   # OTel gRPC receiver on Tempo (internal, avoid conflict with otel-collector)
+    networks: [app-network]
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./infrastructure/otel/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks: [app-network]
+    depends_on: [tempo, prometheus, loki]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus, loki, tempo]
+    networks: [app-network]
+    restart: unless-stopped
+
+  # ─── SPRING CLOUD INFRASTRUCTURE ─────────────────────────────────────────────
+
+  config-server:
+    build:
+      context: ./config-server
+      dockerfile: Dockerfile
+    container_name: config-server
+    environment:
+      SPRING_PROFILES_ACTIVE: native
+      SPRING_CLOUD_CONFIG_SERVER_NATIVE_SEARCH_LOCATIONS: file:/config-repo
+      SPRING_SECURITY_USER_NAME: configuser
+      SPRING_SECURITY_USER_PASSWORD: ${CONFIG_SERVER_PASSWORD}
+    volumes:
+      - ./config-repo:/config-repo
+    ports:
+      - "8888:8888"
+    networks: [app-network]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    container_name: api-gateway
+    environment:
+      SPRING_CLOUD_CONFIG_URI: http://configuser:${CONFIG_SERVER_PASSWORD}@config-server:8888
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    ports:
+      - "8090:8090"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    networks: [app-network]
+    restart: unless-stopped
+
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    container_name: user-service
+    environment:
+      SPRING_CLOUD_CONFIG_URI: http://configuser:${CONFIG_SERVER_PASSWORD}@config-server:8888
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-user:5432/userdb
+      SPRING_DATASOURCE_USERNAME: userservice
+      SPRING_DATASOURCE_PASSWORD: ${USER_DB_PASSWORD}
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      LOKI_URL: http://loki:3100
+    ports:
+      - "8081:8081"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      postgres-user:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    networks: [app-network]
+    restart: unless-stopped
+
+  product-service:
+    build:
+      context: ./product-service
+      dockerfile: Dockerfile
+    container_name: product-service
+    environment:
+      SPRING_CLOUD_CONFIG_URI: http://configuser:${CONFIG_SERVER_PASSWORD}@config-server:8888
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-product:5432/productdb
+      SPRING_DATASOURCE_USERNAME: productservice
+      SPRING_DATASOURCE_PASSWORD: ${PRODUCT_DB_PASSWORD}
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      LOKI_URL: http://loki:3100
+    ports:
+      - "8082:8082"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      postgres-product:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    networks: [app-network]
+    restart: unless-stopped
+
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: order-service
+    environment:
+      SPRING_CLOUD_CONFIG_URI: http://configuser:${CONFIG_SERVER_PASSWORD}@config-server:8888
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-order:5432/orderdb
+      SPRING_DATASOURCE_USERNAME: orderservice
+      SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD}
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      KEYCLOAK_TOKEN_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/token
+      ORDER_SERVICE_CLIENT_SECRET: ${ORDER_SERVICE_CLIENT_SECRET}
+      USER_SERVICE_URL: http://user-service:8081
+      PRODUCT_SERVICE_URL: http://product-service:8082
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      LOKI_URL: http://loki:3100
+    ports:
+      - "8083:8083"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      postgres-order:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+      product-service:
+        condition: service_started
+    networks: [app-network]
+    restart: unless-stopped
+
+  # ─── ANGULAR FRONTEND ─────────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "4200:80"
+    depends_on: [api-gateway]
+    networks: [app-network]
+    restart: unless-stopped

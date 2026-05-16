@@ -1,0 +1,268 @@
+===================================================
+  FULL-STACK MICROSERVICES — START INSTRUCTIONS
+===================================================
+
+PROJECT DIR: D:\MyProjects\MyFullStackSampleWithKeyCloackSample1
+
+---------------------------------------------------
+1. START ALL SERVICES (first run ~5-10 min)
+---------------------------------------------------
+docker compose up --build -d
+
+---------------------------------------------------
+2. MONITOR STARTUP LOGS
+---------------------------------------------------
+docker compose logs -f
+
+  Or per service:
+  docker compose logs -f keycloak
+  docker compose logs -f config-server
+  docker compose logs -f api-gateway
+
+---------------------------------------------------
+3. CHECK ALL CONTAINERS ARE HEALTHY
+---------------------------------------------------
+docker compose ps
+
+---------------------------------------------------
+4. ACCESS POINTS
+---------------------------------------------------
+Angular App        http://localhost:4200          (redirects to Keycloak login)
+API Gateway        http://localhost:8090
+Config Server      http://localhost:8888
+User Service       http://localhost:8081
+Product Service    http://localhost:8082
+Order Service      http://localhost:8083
+Keycloak Admin     http://localhost:8080/admin
+Grafana            http://localhost:3000
+Prometheus         http://localhost:9090
+Loki               http://localhost:3100
+Tempo              http://localhost:3110
+
+---------------------------------------------------
+5. CREDENTIALS
+---------------------------------------------------
+Keycloak Admin:    admin         / Admin@1234!
+Test User:         user1         / User@1234!      (ROLE_USER)
+Test Admin:        admin1        / Admin@1234!     (ROLE_USER + ROLE_ADMIN)
+Grafana:           admin         / grafana_pass
+Config Server:     configuser    / config_pass
+
+---------------------------------------------------
+6. VERIFY KEYCLOAK REALM IS IMPORTED
+---------------------------------------------------
+curl http://localhost:8080/realms/myapp-realm/.well-known/openid-configuration
+
+---------------------------------------------------
+7. TEST API WITH A TOKEN (password grant)
+---------------------------------------------------
+:: Get token
+curl -s -X POST http://localhost:8080/realms/myapp-realm/protocol/openid-connect/token ^
+  -d "grant_type=password&client_id=angular-client&username=user1&password=User@1234!" ^
+  | findstr access_token
+
+:: Call user API  (replace <TOKEN> with value above)
+curl -H "Authorization: Bearer <TOKEN>" http://localhost:8090/api/users
+curl -H "Authorization: Bearer <TOKEN>" http://localhost:8090/api/products
+
+:: Create an order (userId=1, productId=1, quantity=2)
+curl -s -X POST http://localhost:8090/api/orders ^
+  -H "Authorization: Bearer <TOKEN>" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"userId\":1,\"productId\":1,\"quantity\":2}"
+
+:: List all orders
+curl -H "Authorization: Bearer <TOKEN>" http://localhost:8090/api/orders
+
+:: Orders for a specific user
+curl -H "Authorization: Bearer <TOKEN>" http://localhost:8090/api/orders/user/1
+
+---------------------------------------------------
+8. STOP ALL SERVICES
+---------------------------------------------------
+docker compose down
+
+  To also remove volumes (clears databases):
+  docker compose down -v
+
+---------------------------------------------------
+9. REBUILD A SINGLE SERVICE
+---------------------------------------------------
+docker compose up --build -d user-service
+docker compose up --build -d product-service
+docker compose up --build -d order-service
+docker compose up --build -d api-gateway
+docker compose up --build -d frontend
+
+---------------------------------------------------
+10. VIEW LOGS OF A SPECIFIC SERVICE
+---------------------------------------------------
+docker compose logs -f user-service
+docker compose logs -f product-service
+docker compose logs -f api-gateway
+docker compose logs -f keycloak
+
+
+===================================================
+  KUBERNETES — DEPLOY COMMANDS
+===================================================
+
+PROJECT DIR: D:\MyProjects\MyFullStackSampleWithKeyCloackSample1
+
+---------------------------------------------------
+STEP 1: BUILD CUSTOM IMAGES
+---------------------------------------------------
+docker build -t myapp/config-server:1.0.0   ./config-server
+docker build -t myapp/api-gateway:1.0.0     ./api-gateway
+docker build -t myapp/user-service:1.0.0    ./user-service
+docker build -t myapp/product-service:1.0.0 ./product-service
+docker build -t myapp/frontend:1.0.0        ./frontend
+
+---------------------------------------------------
+STEP 2a: LOAD IMAGES (minikube — no registry needed)
+---------------------------------------------------
+minikube image load myapp/config-server:1.0.0
+minikube image load myapp/api-gateway:1.0.0
+minikube image load myapp/user-service:1.0.0
+minikube image load myapp/product-service:1.0.0
+minikube image load myapp/frontend:1.0.0
+
+---------------------------------------------------
+STEP 2b: PUSH IMAGES (remote registry alternative)
+---------------------------------------------------
+:: Replace <registry> with your Docker Hub username or registry URL
+docker tag  myapp/config-server:1.0.0   <registry>/myapp/config-server:1.0.0
+docker push <registry>/myapp/config-server:1.0.0
+docker tag  myapp/api-gateway:1.0.0     <registry>/myapp/api-gateway:1.0.0
+docker push <registry>/myapp/api-gateway:1.0.0
+docker tag  myapp/user-service:1.0.0    <registry>/myapp/user-service:1.0.0
+docker push <registry>/myapp/user-service:1.0.0
+docker tag  myapp/product-service:1.0.0 <registry>/myapp/product-service:1.0.0
+docker push <registry>/myapp/product-service:1.0.0
+docker tag  myapp/frontend:1.0.0        <registry>/myapp/frontend:1.0.0
+docker push <registry>/myapp/frontend:1.0.0
+
+---------------------------------------------------
+STEP 3: ENABLE INGRESS (minikube only)
+---------------------------------------------------
+minikube addons enable ingress
+
+---------------------------------------------------
+STEP 4: DEPLOY EVERYTHING (Kustomize — recommended)
+---------------------------------------------------
+kubectl apply -k k8s/
+
+  Or apply file by file in order:
+  kubectl apply -f k8s/00-namespace.yaml
+  kubectl apply -f k8s/01-secrets.yaml
+  kubectl apply -f k8s/configmaps/
+  kubectl apply -f k8s/storage/
+  kubectl apply -f k8s/databases/
+  kubectl apply -f k8s/auth/
+  kubectl apply -f k8s/spring-cloud/
+  kubectl apply -f k8s/microservices/
+  kubectl apply -f k8s/observability/
+  kubectl apply -f k8s/frontend/
+  kubectl apply -f k8s/20-ingress.yaml
+
+---------------------------------------------------
+STEP 5: ADD HOSTS FILE ENTRIES
+---------------------------------------------------
+:: Windows: C:\Windows\System32\drivers\etc\hosts
+:: Linux/Mac: /etc/hosts
+::
+:: For minikube — get the IP first:
+minikube ip
+::
+:: Then add (replace 192.168.49.2 with your minikube IP):
+::   192.168.49.2  myapp.local keycloak.local grafana.local
+
+---------------------------------------------------
+STEP 6: WATCH ALL PODS START
+---------------------------------------------------
+kubectl get pods -n myapp -w
+
+  Wait until all pods show STATUS=Running and READY=1/1
+
+---------------------------------------------------
+STEP 7: CHECK ALL PODS ARE HEALTHY
+---------------------------------------------------
+kubectl get all -n myapp
+
+---------------------------------------------------
+STEP 8: ACCESS POINTS (after hosts file update)
+---------------------------------------------------
+Angular App        http://myapp.local             (redirects to Keycloak login)
+API (via Ingress)  http://myapp.local/api/users
+Keycloak Admin     http://keycloak.local/admin
+Grafana            http://grafana.local
+Prometheus         kubectl port-forward svc/prometheus 9090:9090 -n myapp
+Loki               kubectl port-forward svc/loki 3100:3100 -n myapp
+
+---------------------------------------------------
+K8s TROUBLESHOOTING COMMANDS
+---------------------------------------------------
+:: Describe a failing pod
+kubectl describe pod <pod-name> -n myapp
+
+:: View logs of a pod
+kubectl logs -f deployment/user-service -n myapp
+kubectl logs -f deployment/keycloak     -n myapp
+kubectl logs -f deployment/api-gateway  -n myapp
+kubectl logs -f deployment/config-server -n myapp
+
+:: View init container logs (useful for startup ordering issues)
+kubectl logs <pod-name> -c wait-for-postgres -n myapp
+kubectl logs <pod-name> -c wait-for-keycloak -n myapp
+
+:: Check events in the namespace
+kubectl get events -n myapp --sort-by='.lastTimestamp'
+
+:: Shell into a running pod
+kubectl exec -it deployment/user-service -n myapp -- sh
+
+:: Check ingress
+kubectl get ingress -n myapp
+kubectl describe ingress myapp-ingress -n myapp
+
+---------------------------------------------------
+K8s TEST API WITH TOKEN
+---------------------------------------------------
+:: Port-forward Keycloak for token request
+kubectl port-forward svc/keycloak 8080:8080 -n myapp
+
+:: Then in a new terminal — get a token
+curl -s -X POST http://localhost:8080/realms/myapp-realm/protocol/openid-connect/token ^
+  -d "grant_type=password&client_id=angular-client&username=user1&password=User@1234!" ^
+  | findstr access_token
+
+:: Port-forward API Gateway
+kubectl port-forward svc/api-gateway 8090:8090 -n myapp
+
+:: Call the API (replace <TOKEN>)
+curl -H "Authorization: Bearer <TOKEN>" http://localhost:8090/api/users
+curl -H "Authorization: Bearer <TOKEN>" http://localhost:8090/api/products
+
+---------------------------------------------------
+TEAR DOWN K8s RESOURCES
+---------------------------------------------------
+:: Remove everything (keeps PVCs — data is safe)
+kubectl delete -k k8s/
+
+:: Remove everything INCLUDING persistent data
+kubectl delete namespace myapp
+
+---------------------------------------------------
+UPDATE A SINGLE SERVICE IN K8s
+---------------------------------------------------
+:: Rebuild image
+docker build -t myapp/user-service:1.0.0 ./user-service
+
+:: Reload into minikube
+minikube image load myapp/user-service:1.0.0
+
+:: Restart the deployment (forces image re-pull)
+kubectl rollout restart deployment/user-service -n myapp
+
+:: Watch rollout status
+kubectl rollout status deployment/user-service -n myapp

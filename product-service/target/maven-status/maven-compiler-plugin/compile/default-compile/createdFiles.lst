@@ -1,0 +1,7 @@
+com\myapp\productservice\service\ProductService.class
+com\myapp\productservice\config\SecurityConfig.class
+com\myapp\productservice\ProductServiceApplication.class
+com\myapp\productservice\config\GlobalExceptionHandler.class
+com\myapp\productservice\controller\ProductController.class
+com\myapp\productservice\repository\ProductRepository.class
+com\myapp\productservice\model\Product.class

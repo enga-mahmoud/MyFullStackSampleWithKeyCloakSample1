@@ -1,0 +1,71 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: api-gateway
+  config:
+    import: "optional:configserver:${SPRING_CLOUD_CONFIG_URI:http://configuser:config_pass@localhost:8888}"
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://localhost:8080/realms/myapp-realm}
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins:
+              - "http://localhost:4200"
+            allowedMethods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            allowedHeaders: "*"
+            allowCredentials: true
+            maxAge: 3600
+      routes:
+        - id: user-service
+          uri: http://user-service:8081
+          predicates:
+            - Path=/api/users/**
+          filters:
+            - TokenRelay=
+        - id: product-service
+          uri: http://product-service:8082
+          predicates:
+            - Path=/api/products/**
+          filters:
+            - TokenRelay=
+        - id: order-service
+          uri: http://order-service:8083
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - TokenRelay=
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,gateway
+  endpoint:
+    health:
+      show-details: always
+  tracing:
+    sampling:
+      probability: 1.0
+
+logging:
+  pattern:
+    level: "%5p [%X{traceId:-},%X{spanId:-}]"
+
+otel:
+  exporter:
+    otlp:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4317}
+  service:
+    name: api-gateway

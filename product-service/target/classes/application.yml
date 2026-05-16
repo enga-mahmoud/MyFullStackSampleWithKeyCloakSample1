@@ -1,0 +1,39 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: product-service
+  config:
+    import: "optional:configserver:${SPRING_CLOUD_CONFIG_URI:http://configuser:config_pass@localhost:8888}"
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5434/productdb}
+    username: ${SPRING_DATASOURCE_USERNAME:productservice}
+    password: ${SPRING_DATASOURCE_PASSWORD:product_db_pass}
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://localhost:8080/realms/myapp-realm}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  tracing:
+    sampling:
+      probability: 1.0
+
+otel:
+  exporter:
+    otlp:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4317}
+  service:
+    name: product-service
+
+loki:
+  url: ${LOKI_URL:http://localhost:3100}

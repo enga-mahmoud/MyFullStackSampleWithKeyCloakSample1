@@ -1,0 +1,62 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: order-service
+  # Keep Tomcat (servlet) as the web server even though spring-webflux is on
+  # the classpath (used only for WebClient outbound calls, not for serving).
+  main:
+    web-application-type: servlet
+  config:
+    import: "optional:configserver:${SPRING_CLOUD_CONFIG_URI:http://configuser:config_pass@localhost:8888}"
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5435/orderdb}
+    username: ${SPRING_DATASOURCE_USERNAME:orderservice}
+    password: ${SPRING_DATASOURCE_PASSWORD:order_db_pass}
+  security:
+    oauth2:
+      # Resource-server: validates incoming Bearer JWTs from users (via API Gateway)
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://localhost:8080/realms/myapp-realm}
+      # OAuth2 client: obtains a token via client_credentials to call other services
+      client:
+        registration:
+          keycloak:
+            authorization-grant-type: client_credentials
+            client-id: ${ORDER_SERVICE_CLIENT_ID:order-service-client}
+            client-secret: ${ORDER_SERVICE_CLIENT_SECRET:order-service-secret}
+            scope: openid
+        provider:
+          keycloak:
+            token-uri: ${KEYCLOAK_TOKEN_URI:http://localhost:8080/realms/myapp-realm/protocol/openid-connect/token}
+
+# Base URLs for upstream microservices (injected as env vars in Docker / K8s)
+services:
+  user-service:
+    url: ${USER_SERVICE_URL:http://localhost:8081}
+  product-service:
+    url: ${PRODUCT_SERVICE_URL:http://localhost:8082}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  tracing:
+    sampling:
+      probability: 1.0
+
+otel:
+  exporter:
+    otlp:
+      endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4317}
+  service:
+    name: order-service
+
+loki:
+  url: ${LOKI_URL:http://localhost:3100}

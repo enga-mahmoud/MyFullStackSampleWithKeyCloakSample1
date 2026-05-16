@@ -1,0 +1,2 @@
+com\myapp\gateway\ApiGatewayApplication.class
+com\myapp\gateway\config\SecurityConfig.class
