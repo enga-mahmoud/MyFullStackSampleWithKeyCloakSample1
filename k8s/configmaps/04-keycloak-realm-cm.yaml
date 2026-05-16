@@ -86,6 +86,35 @@ data:
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": true,
           "bearerOnly": true
+        },
+        {
+          "clientId": "order-service-client",
+          "name": "Order Service Client",
+          "description": "Confidential client for order-service machine-to-machine calls using client_credentials grant",
+          "enabled": true,
+          "clientAuthenticatorType": "client-secret",
+          "secret": "order-service-secret",
+          "publicClient": false,
+          "standardFlowEnabled": false,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": true,
+          "protocolMappers": [
+            {
+              "name": "realm-roles-mapper",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-realm-role-mapper",
+              "consentRequired": false,
+              "config": {
+                "multivalued": "true",
+                "userinfo.token.claim": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "claim.name": "roles",
+                "jsonType.label": "String"
+              }
+            }
+          ]
         }
       ],
       "users": [
@@ -119,6 +148,12 @@ data:
               "temporary": false
             }
           ],
+          "realmRoles": ["ROLE_USER", "ROLE_ADMIN"]
+        },
+        {
+          "username": "service-account-order-service-client",
+          "enabled": true,
+          "serviceAccountClientId": "order-service-client",
           "realmRoles": ["ROLE_USER", "ROLE_ADMIN"]
         }
       ],
