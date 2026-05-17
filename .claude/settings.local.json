@@ -9,7 +9,17 @@
       "PowerShell(Rename-Item *)",
       "Bash(Select-String -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\" -Pattern \"^={3,}|^## |^### \")",
       "Bash(Select-Object LineNumber, Line)",
-      "Bash(Format-Table -AutoSize)"
+      "Bash(Format-Table -AutoSize)",
+      "Bash(Get-ChildItem -Path \"D:\\\\Projects\\\\BitBucketLocalRepository\\\\MyFullStackSampleWithKeyCloackSample1\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(Get-Content \"D:\\\\Projects\\\\BitBucketLocalRepository\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\")",
+      "Bash(Measure-Object -Line)",
+      "Bash(Select-Object -ExpandProperty Lines)",
+      "PowerShell(\\(Get-Content \"D:\\\\Projects\\\\BitBucketLocalRepository\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\" | Measure-Object -Line\\).Lines)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
