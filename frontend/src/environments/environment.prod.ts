@@ -1,4 +1,4 @@
 export const environment = {
   production: true,
-  keycloakUrl: 'http://keycloak.local',
+  keycloakUrl: 'http://localhost:8080',
 };

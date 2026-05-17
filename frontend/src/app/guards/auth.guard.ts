@@ -9,7 +9,7 @@ export const authGuard: CanActivateFn = async (route) => {
   const isLoggedIn = keycloak.isLoggedIn();
 
   if (!isLoggedIn) {
-    await keycloak.login({ redirectUri: window.location.origin + route.url.join('/') });
+    await keycloak.login({ redirectUri: window.location.origin + '/' + route.url.join('/') });
     return false;
   }
 
@@ -18,7 +18,9 @@ export const authGuard: CanActivateFn = async (route) => {
     return true;
   }
 
-  const hasRole = requiredRoles.some((role) => keycloak.isUserInRole(role));
+  const tokenParsed = keycloak.getKeycloakInstance().tokenParsed as Record<string, unknown>;
+  const userRoles = (tokenParsed?.['roles'] as string[]) ?? [];
+  const hasRole = requiredRoles.some((role) => userRoles.includes(role));
   if (!hasRole) {
     router.navigate(['/dashboard']);
     return false;

@@ -32,20 +32,14 @@ spring:
           uri: http://user-service:8081
           predicates:
             - Path=/api/users/**
-          filters:
-            - TokenRelay=
         - id: product-service
           uri: http://product-service:8082
           predicates:
             - Path=/api/products/**
-          filters:
-            - TokenRelay=
         - id: order-service
           uri: http://order-service:8083
           predicates:
             - Path=/api/orders/**
-          filters:
-            - TokenRelay=
 
 management:
   endpoints:

@@ -1,0 +1,8 @@
+# Patterns ignored when packaging the chart with `helm package`.
+.DS_Store
+*.tgz
+*.swp
+.git/
+.gitignore
+values.secrets.yaml
+README.md

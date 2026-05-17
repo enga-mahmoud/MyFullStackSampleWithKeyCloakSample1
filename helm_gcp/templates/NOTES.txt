@@ -1,0 +1,32 @@
+MyApp has been deployed to namespace {{ .Release.Namespace }}.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SERVICE URLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Frontend      : https://{{ .Values.domain.app }}
+  API Gateway   : https://{{ .Values.domain.app }}/api/
+  Keycloak Admin: https://{{ .Values.domain.keycloak }}/admin
+  Grafana       : https://{{ .Values.domain.grafana }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Check Ingress (GCP LB provisioning takes ~5–10 min):
+     kubectl get ingress -n {{ .Release.Namespace }}
+
+2. Check TLS certificate status (takes up to 60 min after DNS resolves):
+     kubectl describe managedcertificate myapp-cert -n {{ .Release.Namespace }}
+
+3. Watch all pods come up:
+     kubectl get pods -n {{ .Release.Namespace }} -w
+
+4. View HPA status:
+     kubectl get hpa -n {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CREDENTIALS (change these in production!)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Keycloak admin : admin / Admin@1234!
+  Test user      : user1 / User@1234!
+  Test admin     : admin1 / Admin@1234!
+  Grafana        : admin / (from secrets.grafanaAdminPassword)

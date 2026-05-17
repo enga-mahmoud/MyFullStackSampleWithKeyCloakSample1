@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-repo
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+data:
+  application.yml: |
+    spring:
+      jpa:
+        hibernate:
+          ddl-auto: update
+        show-sql: false
+        properties:
+          hibernate:
+            dialect: org.hibernate.dialect.PostgreSQLDialect
+            format_sql: false
+
+    management:
+      endpoints:
+        web:
+          exposure:
+            include: health,info,metrics,prometheus
+      endpoint:
+        health:
+          show-details: always
+      metrics:
+        export:
+          prometheus:
+            enabled: true
+      tracing:
+        sampling:
+          probability: 1.0
+
+    logging:
+      pattern:
+        level: "%5p [%X{traceId:-},%X{spanId:-}]"
+      level:
+        root: INFO
+        com.myapp: DEBUG
+
+  user-service.yml: |
+    spring:
+      datasource:
+        driver-class-name: org.postgresql.Driver
+      jpa:
+        database-platform: org.hibernate.dialect.PostgreSQLDialect
+    logging:
+      level:
+        com.myapp.userservice: DEBUG
+
+  product-service.yml: |
+    spring:
+      datasource:
+        driver-class-name: org.postgresql.Driver
+      jpa:
+        database-platform: org.hibernate.dialect.PostgreSQLDialect
+    logging:
+      level:
+        com.myapp.productservice: DEBUG
+
+  order-service.yml: |
+    spring:
+      datasource:
+        driver-class-name: org.postgresql.Driver
+      jpa:
+        database-platform: org.hibernate.dialect.PostgreSQLDialect
+    logging:
+      level:
+        com.myapp.orderservice: DEBUG

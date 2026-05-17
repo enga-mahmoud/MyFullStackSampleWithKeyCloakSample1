@@ -72,13 +72,10 @@ export class DashboardComponent implements OnInit {
   constructor(private keycloak: KeycloakService) {}
 
   ngOnInit(): void {
-    this.username = this.keycloak.getUsername();
-    this.isAdmin = this.keycloak.isUserInRole('ROLE_ADMIN');
-    this.keycloak.loadUserProfile().then((profile) => {
-      this.email = profile.email ?? '';
-    });
-    const token = this.keycloak.getKeycloakInstance();
-    const parsed = token.tokenParsed as Record<string, unknown>;
+    const parsed = this.keycloak.getKeycloakInstance().tokenParsed as Record<string, unknown>;
+    this.username = (parsed?.['preferred_username'] as string) ?? '';
+    this.email = (parsed?.['email'] as string) ?? '';
     this.roles = (parsed?.['roles'] as string[]) ?? [];
+    this.isAdmin = this.keycloak.isUserInRole('ROLE_ADMIN');
   }
 }

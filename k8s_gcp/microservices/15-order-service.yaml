@@ -1,0 +1,108 @@
+# KEYCLOAK_ISSUER_URI: external HTTPS URL — matches the iss claim in tokens issued by
+#                      Keycloak on GCP (KC_HOSTNAME is the external domain).
+# KEYCLOAK_TOKEN_URI:  internal pod-to-pod URL — order-service fetches machine tokens
+#                      directly from the Keycloak pod, avoiding the public LB roundtrip.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgres-order 5432; do echo waiting for postgres-order; sleep 3; done']
+        - name: wait-for-config-server
+          image: busybox:1.36
+          command: ['sh', '-c', 'until wget -qO- http://config-server:8888/actuator/health; do echo waiting for config-server; sleep 5; done']
+        - name: wait-for-keycloak
+          image: busybox:1.36
+          command: ['sh', '-c', 'until wget -qO- http://keycloak:8080/health/ready; do echo waiting for keycloak; sleep 5; done']
+
+      containers:
+        - name: order-service
+          image: REGION-docker.pkg.dev/PROJECT_ID/myapp/order-service:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8083
+          env:
+            - name: CONFIG_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-secret
+                  key: CONFIG_SERVER_PASSWORD
+            - name: SPRING_CLOUD_CONFIG_URI
+              value: http://configuser:$(CONFIG_SERVER_PASSWORD)@config-server:8888
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://postgres-order:5432/orderdb
+            - name: SPRING_DATASOURCE_USERNAME
+              value: orderservice
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: order-db-secret
+                  key: ORDER_DB_PASSWORD
+            # JWT iss claim will be https://KEYCLOAK_DOMAIN/realms/myapp-realm
+            - name: KEYCLOAK_ISSUER_URI
+              value: https://KEYCLOAK_DOMAIN/realms/myapp-realm
+            # Use internal Keycloak URL for client_credentials token fetching (faster, no LB)
+            - name: KEYCLOAK_TOKEN_URI
+              value: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/token
+            - name: ORDER_SERVICE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: order-client-secret
+                  key: ORDER_SERVICE_CLIENT_SECRET
+            - name: USER_SERVICE_URL
+              value: http://user-service:8081
+            - name: PRODUCT_SERVICE_URL
+              value: http://product-service:8082
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4317
+            - name: LOKI_URL
+              value: http://loki:3100
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8083
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8083
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 800m
+              memory: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: myapp
+spec:
+  type: ClusterIP
+  selector:
+    app: order-service
+  ports:
+    - port: 8083
+      targetPort: 8083

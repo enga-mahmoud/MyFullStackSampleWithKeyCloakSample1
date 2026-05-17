@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: myapp
+
+resources:
+  - 00-namespace.yaml
+  - 01-secrets.yaml
+  - configmaps/02-config-repo-cm.yaml
+  - configmaps/03-infra-configs-cm.yaml
+  - configmaps/04-keycloak-realm-cm.yaml
+  - storage/05-pvcs.yaml
+  - databases/06-postgres-keycloak.yaml
+  - databases/07-postgres-user.yaml
+  - databases/08-postgres-product.yaml
+  - databases/09-postgres-order.yaml
+  - auth/10-keycloak.yaml
+  - spring-cloud/11-config-server.yaml
+  - spring-cloud/12-api-gateway.yaml
+  - microservices/13-user-service.yaml
+  - microservices/14-product-service.yaml
+  - microservices/15-order-service.yaml
+  - observability/16-otel-collector.yaml
+  - observability/17-prometheus.yaml
+  - observability/18-loki.yaml
+  - observability/19-tempo.yaml
+  - observability/20-grafana.yaml
+  - frontend/21-frontend.yaml
+  - ingress/22-backend-configs.yaml
+  - ingress/23-frontend-config.yaml
+  - ingress/24-managed-certs.yaml
+  - ingress/25-ingress.yaml
+  - scaling/26-hpa.yaml
+  - scaling/27-pdb.yaml

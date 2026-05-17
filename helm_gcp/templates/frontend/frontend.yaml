@@ -1,0 +1,67 @@
+# The frontend image must be built with the production Angular config which
+# bakes in environment.prod.ts (keycloakUrl: https://KEYCLOAK_DOMAIN).
+# Update frontend/src/environments/environment.prod.ts before building:
+#   keycloakUrl: 'https://{{ .Values.domain.keycloak }}'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas.frontend }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "frontend" "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "myapp.selectorLabels" (dict "component" "frontend" "root" .) | nindent 8 }}
+    spec:
+      containers:
+        - name: frontend
+          image: {{ include "myapp.image" (dict "service" "frontend" "root" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /index.html
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources.frontend | nindent 12 }}
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    cloud.google.com/backend-config: '{"default": "frontend-backend-config"}'
+spec:
+  type: NodePort
+  selector:
+    {{- include "myapp.selectorLabels" (dict "component" "frontend" "root" .) | nindent 4 }}
+  ports:
+    - port: 80
+      targetPort: 80

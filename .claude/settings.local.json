@@ -12,6 +12,15 @@
       "Bash(Format-Table -AutoSize)",
       "Bash(Get-ChildItem -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\" -Recurse -Force)",
       "Bash(Select-Object FullName)"
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(Get-Content \"D:\\\\Projects\\\\BitBucketLocalRepository\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\")",
+      "Bash(Measure-Object -Line)",
+      "Bash(Select-Object -ExpandProperty Lines)",
+      "PowerShell(\\(Get-Content \"D:\\\\Projects\\\\BitBucketLocalRepository\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\" | Measure-Object -Line\\).Lines)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }

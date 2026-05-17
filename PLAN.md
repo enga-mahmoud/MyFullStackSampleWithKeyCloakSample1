@@ -205,14 +205,30 @@ MyFullStackSampleWithKeyCloackSample1/
 Browser → Angular app loads, Keycloak.init() checks SSO session
        → No session → redirected to Keycloak login page (:8080)
        → User logs in → Keycloak issues JWT with "roles" claim
+         (iss claim = http://localhost:8080/realms/myapp-realm)
        → Redirect back to Angular with token
 
 Angular → every /api request → authInterceptor adds Bearer JWT
-       → API Gateway validates JWT (Keycloak JWKS endpoint)
-       → TokenRelay= filter copies JWT to downstream request
-       → Microservice validates JWT independently (defense in depth)
+       → nginx (frontend container) proxies /api/* to api-gateway:8090
+       → API Gateway validates JWT signature via JWK Set fetched from
+         http://keycloak:8080 (Docker-internal hostname); validates iss
+         claim against http://localhost:8080/realms/myapp-realm
+       → Gateway forwards request to downstream service, preserving the
+         Authorization: Bearer <JWT> header (no TokenRelay= needed)
+       → Microservice validates JWT independently using the same
+         jwk-set-uri / issuer-uri split (defense in depth)
        → @PreAuthorize checks role from JWT → allows or 403
 ```
+
+**JWT validation split (Docker Compose):**
+All Spring Boot services use two env vars to avoid the OIDC-discovery
+`localhost` hostname trap. With KC_HOSTNAME=localhost, Keycloak's
+discovery doc returns `jwks_uri: http://localhost:8080/...` — which is
+unreachable from inside Docker containers. The fix:
+- `SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI` → `http://keycloak:8080/...`
+  fetches JWK keys directly from the Docker-internal hostname (bypasses discovery)
+- `KEYCLOAK_ISSUER_URI` → `http://localhost:8080/realms/myapp-realm`
+  validates the `iss` claim in JWTs (matches what Keycloak puts in tokens)
 
 ### Service-to-service flow (client_credentials — order-service only)
 ```
@@ -280,6 +296,7 @@ POST /api/orders (user Bearer JWT) → API Gateway → order-service
 | /dashboard | DashboardComponent | authGuard | any authenticated |
 | /users | UsersComponent | authGuard | ROLE_USER |
 | /products | ProductsComponent | authGuard | ROLE_USER |
+| /orders | OrdersComponent | authGuard | ROLE_USER |
 | /admin | AdminComponent | authGuard | ROLE_ADMIN |
 
 ---
