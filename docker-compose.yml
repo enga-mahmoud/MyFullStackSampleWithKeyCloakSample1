@@ -234,7 +234,8 @@ services:
     container_name: api-gateway
     environment:
       SPRING_CLOUD_CONFIG_URI: http://configuser:${CONFIG_SERVER_PASSWORD}@config-server:8888
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/myapp-realm
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/certs
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
     ports:
       - "8090:8090"
@@ -256,7 +257,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-user:5432/userdb
       SPRING_DATASOURCE_USERNAME: userservice
       SPRING_DATASOURCE_PASSWORD: ${USER_DB_PASSWORD}
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/myapp-realm
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/certs
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       LOKI_URL: http://loki:3100
     ports:
@@ -281,7 +283,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-product:5432/productdb
       SPRING_DATASOURCE_USERNAME: productservice
       SPRING_DATASOURCE_PASSWORD: ${PRODUCT_DB_PASSWORD}
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/myapp-realm
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/certs
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       LOKI_URL: http://loki:3100
     ports:
@@ -306,7 +309,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-order:5432/orderdb
       SPRING_DATASOURCE_USERNAME: orderservice
       SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD}
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/myapp-realm
+      KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/myapp-realm
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/certs
       KEYCLOAK_TOKEN_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/token
       ORDER_SERVICE_CLIENT_SECRET: ${ORDER_SERVICE_CLIENT_SECRET}
       USER_SERVICE_URL: http://user-service:8081

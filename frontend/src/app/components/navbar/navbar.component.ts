@@ -94,7 +94,8 @@ export class NavbarComponent implements OnInit {
   ngOnInit(): void {
     this.isLoggedIn = this.keycloak.isLoggedIn();
     if (this.isLoggedIn) {
-      this.username = this.keycloak.getUsername();
+      const token = this.keycloak.getKeycloakInstance().tokenParsed as Record<string, unknown>;
+      this.username = (token?.['preferred_username'] as string) ?? '';
       this.isAdmin = this.keycloak.isUserInRole('ROLE_ADMIN');
     }
   }

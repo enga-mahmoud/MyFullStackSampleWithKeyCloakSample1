@@ -29,6 +29,16 @@ docker-compose.yml
       Spring Boot apps start.
     - order-service additionally depends on user-service and
       product-service being started (service_started condition).
+    - Health checks use wget (not curl) for Spring Boot services since
+      eclipse-temurin:21-jre-alpine does not include curl. Keycloak's
+      health check uses /bin/bash /dev/tcp to probe port 8080 since the
+      Keycloak UBI9 image also has no curl.
+    - All Spring Boot services receive SPRING_SECURITY_OAUTH2_RESOURCESERVER
+      _JWT_JWK_SET_URI pointing to http://keycloak:8080/... (Docker-
+      internal) and KEYCLOAK_ISSUER_URI=http://localhost:8080/... (actual
+      JWT issuer). This split bypasses Keycloak's OIDC discovery document
+      (which contains localhost URLs unreachable from inside containers)
+      while still validating the iss claim in every JWT.
 
 .env
   PURPOSE : Central store for all secrets and configurable values used
@@ -245,6 +255,9 @@ api-gateway/pom.xml
       endpoint for Prometheus to scrape metrics.
     - Declares micrometer-tracing-bridge-otel + opentelemetry-exporter-otlp:
       sends distributed traces to the OTel Collector.
+    - NOTE: spring-boot-starter-oauth2-client is intentionally NOT included.
+      TokenRelay= is not used (see application.yml note). Adding the client
+      starter without OAuth2 client registrations can cause runtime issues.
 
 api-gateway/src/main/resources/application.yml
   PURPOSE : Runtime configuration for the API Gateway.
@@ -252,17 +265,39 @@ api-gateway/src/main/resources/application.yml
     - Binds to port 8090.
     - Configures the Config Server import URI so the gateway fetches
       shared config at startup.
-    - Sets the Keycloak JWT issuer URI so Spring validates tokens against
-      the correct Keycloak realm's JWKS endpoint.
+    - Sets JWT validation via two properties (see JWT split note below):
+        spring.security.oauth2.resourceserver.jwt.issuer-uri  — iss claim validation
+        spring.security.oauth2.resourceserver.jwt.jwk-set-uri — key fetch URL
     - Defines global CORS policy allowing requests from http://localhost:4200
       (the Angular app) with all HTTP methods and Authorization header.
-    - Defines three routes:
+    - Defines three routes with NO filters:
         /api/users/**   → forwards to http://user-service:8081
         /api/products/** → forwards to http://product-service:8082
         /api/orders/**  → forwards to http://order-service:8083
-    - Applies the TokenRelay= filter on all routes, which copies the
-      incoming Authorization: Bearer <JWT> header to the downstream request.
+    - The Authorization: Bearer <JWT> header from the incoming request is
+      forwarded to downstream services automatically by Spring Cloud Gateway
+      without any explicit TokenRelay= filter. TokenRelay= was removed
+      because it is designed for OAuth2 login flows, not resource-server
+      (JWT) mode, and caused 502 errors when no OAuth2 client registration
+      was configured.
     - Configures OTel exporter endpoint for trace export.
+
+  JWT VALIDATION SPLIT (Docker Compose):
+    With KC_HOSTNAME=localhost, Keycloak's OIDC discovery document returns
+    jwks_uri: http://localhost:8080/... — which inside Docker resolves to
+    the container itself (not Keycloak), causing JWK Set fetches to fail.
+    The fix is to bypass OIDC discovery entirely:
+      KEYCLOAK_ISSUER_URI=http://localhost:8080/realms/myapp-realm
+        → spring.security.oauth2.resourceserver.jwt.issuer-uri
+        → used only to validate the iss claim in incoming JWTs (matches
+          the actual value Keycloak puts in tokens)
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI=http://keycloak:8080/...
+        → spring.security.oauth2.resourceserver.jwt.jwk-set-uri
+        → when jwk-set-uri is set, Spring Boot fetches keys directly from
+          this URL without doing OIDC discovery, using the Docker-internal
+          keycloak hostname which is always reachable
+    When both properties are set, jwk-set-uri takes precedence for the
+    decoder and issuer-uri is used only for the iss claim validator.
 
 api-gateway/src/main/java/.../ApiGatewayApplication.java
   PURPOSE : Spring Boot entry point for the API Gateway.
@@ -1047,12 +1082,15 @@ infrastructure/otel/otel-collector-config.yaml
         otlp/tempo — forwards traces to Tempo's gRPC receiver.
         prometheusremotewrite — pushes metrics to Prometheus's remote
         write endpoint.
-        loki — pushes logs to Loki's push endpoint.
+        otlphttp/loki — pushes logs to Loki 3.0's native OTLP endpoint
+        (http://loki:3100/otlp). NOTE: the older "loki" exporter was
+        removed from the OpenTelemetry Collector contrib distribution;
+        Loki 3.0 accepts logs directly via OTLP at /otlp.
         debug — prints a summary to the collector's stdout for debugging.
     - Defines three pipelines:
         traces  → otlp receiver → batch → tempo
         metrics → otlp receiver → batch → prometheus
-        logs    → otlp receiver → batch → loki
+        logs    → otlp receiver → batch → otlphttp/loki
 
 ---------------------------------------------------------------------
   infrastructure/prometheus/
@@ -1171,6 +1209,9 @@ frontend/angular.json
     - Defines production build configuration with a fileReplacements rule
       that swaps environment.ts → environment.prod.ts so the Keycloak URL
       is environment-specific without maintaining separate builds.
+    - Defines k8s build configuration with a fileReplacements rule that
+      swaps environment.ts → environment.k8s.ts for Kubernetes deployments
+      where Keycloak is accessed via the keycloak.local Ingress hostname.
     - Defines development build configuration with source maps and no
       optimisation.
     - Configures the dev server to use proxy.conf.json (so /api requests
@@ -1211,6 +1252,13 @@ frontend/nginx.conf
     - Proxies /api/ requests to the api-gateway container by name
       (http://api-gateway:8090), so the browser never talks directly to
       the gateway (same-origin from the browser's perspective).
+    - Uses proxy_http_version 1.1 and proxy_set_header Connection ""
+      for the /api/ proxy block, enabling proper HTTP/1.1 keep-alive
+      connections to Spring Cloud Gateway's reactive Netty server. Without
+      this, nginx defaults to HTTP/1.0 which can cause 502 errors with
+      reactive backends.
+    - Explicitly forwards the Authorization header via proxy_set_header
+      so the Bearer JWT token is always passed to the API Gateway.
     - Enables gzip compression for text assets.
     - Sets 1-year cache headers with immutable for hashed static assets
       (JS, CSS files Angular names with content hashes on production build).
@@ -1259,11 +1307,21 @@ frontend/src/environments/environment.prod.ts
   PURPOSE : Production environment variables swapped in during the
             production build via angular.json fileReplacements.
   WHAT IT DOES :
-    - Exports { production: true, keycloakUrl: 'http://keycloak.local' }.
+    - Exports { production: true, keycloakUrl: 'http://localhost:8080' }.
     - Used when building with ng build --configuration production
-      (the default in the Dockerfile).
+      (the default in the Dockerfile), which targets Docker Compose.
+    - Points to the host-exposed Keycloak port so the browser can reach
+      Keycloak at the same URL it uses directly (localhost:8080).
+
+frontend/src/environments/environment.k8s.ts
+  PURPOSE : Kubernetes-specific environment variables for the k8s build.
+  WHAT IT DOES :
+    - Exports { production: true, keycloakUrl: 'http://keycloak.local' }.
+    - Used when building with ng build --configuration k8s.
     - Points to the Keycloak Ingress hostname used in Kubernetes so the
       browser can reach Keycloak without knowing any internal IP or port.
+    - Build the K8s image with: ng build --configuration k8s (or update
+      the Dockerfile to use --configuration k8s instead of production).
 
 frontend/src/main.ts
   PURPOSE : Angular application bootstrap entry point.
@@ -1335,12 +1393,22 @@ frontend/src/app/guards/auth.guard.ts
   PURPOSE : Route guard that protects pages requiring authentication and roles.
   WHAT IT DOES :
     - CanActivateFn checks if keycloak.isLoggedIn().
-    - If not logged in: calls keycloak.login() which redirects the browser
-      to the Keycloak login page; returns false to cancel navigation.
+    - If not logged in: calls keycloak.login({ redirectUri }) with a
+      properly formed redirect URI (window.location.origin + '/' +
+      route.url.join('/')) to return the user to the intended page after
+      login; returns false to cancel navigation.
     - If logged in: reads route.data['roles'] (e.g. ['ROLE_ADMIN']).
     - If no roles required: returns true (any authenticated user may access).
-    - If roles required: checks keycloak.isUserInRole() for each required
-      role; if none match, redirects to /dashboard and returns false.
+    - If roles required: reads the 'roles' array directly from
+      keycloak.getKeycloakInstance().tokenParsed (the custom Keycloak
+      Protocol Mapper puts roles at the top-level 'roles' claim, not in
+      realm_access.roles). Checks each required role against this array;
+      if none match, redirects to /dashboard and returns false.
+    - NOTE: keycloak.isUserInRole() is NOT used for role checks because
+      it reads from realm_access.roles (the default Keycloak location),
+      whereas this project's Protocol Mapper puts roles in a custom top-
+      level 'roles' claim. Reading tokenParsed directly is the correct
+      approach for this project's JWT structure.
 
 frontend/src/app/services/api.service.ts
   PURPOSE : Centralised HTTP client service for all backend API calls.
@@ -1376,6 +1444,15 @@ frontend/src/app/components/navbar/navbar.component.ts
       and then back to the app origin).
     - Uses RouterLink and RouterLinkActive for navigation with active
       link highlighting.
+    - Reads username from keycloak.getKeycloakInstance().tokenParsed
+      ['preferred_username'] rather than keycloak.getUsername(), because
+      getUsername() in keycloak-angular v16 requires loadUserProfile() to
+      be called first (which makes an extra CORS-restricted HTTP request
+      to Keycloak's account endpoint). Reading tokenParsed is instant and
+      requires no additional network calls.
+    - Checks isAdmin via keycloak.isUserInRole('ROLE_ADMIN'), which works
+      because the navbar only uses this for UI display (not for security
+      enforcement). Security is enforced by authGuard reading tokenParsed.
 
 ---------------------------------------------------------------------
   src/app/pages/
@@ -1389,8 +1466,13 @@ frontend/src/app/pages/dashboard/dashboard.component.ts
       (conditionally) Admin pages.
     - Displays a "Token Info" card showing username, email, and all roles
       parsed directly from the Keycloak JWT — useful for debugging auth.
-    - Calls keycloak.loadUserProfile() to fetch the email from the
-      Keycloak server.
+    - Reads all user data (username, email, roles) directly from
+      keycloak.getKeycloakInstance().tokenParsed instead of calling
+      keycloak.loadUserProfile(). This avoids an extra HTTP request to
+      Keycloak's /account endpoint, which is restricted by CORS when
+      Keycloak is not configured to allow the Angular app's origin for
+      account API calls. The JWT already contains all needed fields
+      (preferred_username, email, roles).
 
 frontend/src/app/pages/users/users.component.ts
   PURPOSE : User management page.

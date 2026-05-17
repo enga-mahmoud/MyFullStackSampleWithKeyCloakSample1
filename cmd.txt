@@ -94,6 +94,11 @@ docker compose up --build -d order-service
 docker compose up --build -d api-gateway
 docker compose up --build -d frontend
 
+  Rebuild api-gateway + frontend (after route/pom/nginx changes);
+  restart microservices to pick up new env vars:
+  docker compose up --build -d api-gateway frontend
+  docker compose restart user-service product-service order-service
+
 ---------------------------------------------------
 10. VIEW LOGS OF A SPECIFIC SERVICE
 ---------------------------------------------------
