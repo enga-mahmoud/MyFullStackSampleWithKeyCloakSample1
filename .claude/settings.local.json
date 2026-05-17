@@ -11,7 +11,7 @@
       "Bash(Select-Object LineNumber, Line)",
       "Bash(Format-Table -AutoSize)",
       "Bash(Get-ChildItem -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\" -Recurse -Force)",
-      "Bash(Select-Object FullName)"
+      "Bash(Select-Object FullName)",
       "Bash(Select-Object -ExpandProperty FullName)",
       "Bash(Sort-Object)",
       "Bash(Get-Content \"D:\\\\Projects\\\\BitBucketLocalRepository\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\")",
@@ -20,7 +20,13 @@
       "PowerShell(\\(Get-Content \"D:\\\\Projects\\\\BitBucketLocalRepository\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\" | Measure-Object -Line\\).Lines)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "PowerShell(netstat *)",
+      "PowerShell(Get-Process *)",
+      "Bash(Get-ChildItem -Recurse -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\\\\frontend\\\\src\\\\app\\\\pages\" -Filter \"*.html\")",
+      "Bash(docker exec *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(docker compose *)"
     ]
   }
 }

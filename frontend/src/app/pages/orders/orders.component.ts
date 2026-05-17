@@ -13,7 +13,7 @@ import { ApiService, Order, Product, CreateOrderRequest } from '../../services/a
     <div class="page">
       <div class="flex justify-between align-center mb-3">
         <h1>Orders</h1>
-        <button class="btn btn-primary" (click)="openPlaceOrder()" [disabled]="!currentUserId">
+        <button class="btn btn-primary" (click)="openPlaceOrder()" [disabled]="!isAdmin && !currentUserId">
           + Place Order
         </button>
       </div>
@@ -69,6 +69,14 @@ import { ApiService, Order, Product, CreateOrderRequest } from '../../services/a
 
         <div *ngIf="orderError" class="err-banner" style="margin-bottom:1rem;">{{ orderError }}</div>
 
+        <div class="form-group" *ngIf="isAdmin">
+          <label>User *</label>
+          <select [(ngModel)]="form.userId">
+            <option [ngValue]="0" disabled>— Select a user —</option>
+            <option *ngFor="let entry of userEntries" [ngValue]="entry[0]">{{ entry[1] }}</option>
+          </select>
+        </div>
+
         <div class="form-group">
           <label>Product *</label>
           <select [(ngModel)]="form.productId">
@@ -103,7 +111,7 @@ import { ApiService, Order, Product, CreateOrderRequest } from '../../services/a
           <button
             class="btn btn-primary"
             (click)="placeOrder()"
-            [disabled]="placing || !form.productId || form.quantity < 1"
+            [disabled]="placing || !form.productId || form.quantity < 1 || (isAdmin && !form.userId)"
           >
             {{ placing ? 'Placing…' : 'Place Order' }}
           </button>
@@ -156,7 +164,7 @@ export class OrdersComponent implements OnInit {
   isAdmin = false;
   currentUserId?: number;
 
-  form = { productId: 0, quantity: 1 };
+  form = { productId: 0, quantity: 1, userId: 0 };
 
   get selectedProduct(): Product | undefined {
     return this.products.find(p => p.id === this.form.productId);
@@ -166,11 +174,16 @@ export class OrdersComponent implements OnInit {
     return this.products.filter(p => p.stock > 0);
   }
 
+  get userEntries(): [number, string][] {
+    return Object.entries(this.userMap).map(([id, name]) => [+id, name]);
+  }
+
   constructor(private api: ApiService, private keycloak: KeycloakService) {}
 
   ngOnInit(): void {
-    this.isAdmin = this.keycloak.isUserInRole('ROLE_ADMIN');
-    const username = this.keycloak.getUsername();
+    const token = this.keycloak.getKeycloakInstance().tokenParsed as Record<string, unknown>;
+    this.isAdmin = ((token?.['roles'] as string[]) ?? []).includes('ROLE_ADMIN');
+    const username = (token?.['preferred_username'] as string) ?? '';
 
     this.api.getProducts().subscribe({
       next: (prods) => {
@@ -208,18 +221,35 @@ export class OrdersComponent implements OnInit {
   }
 
   openPlaceOrder(): void {
-    this.form = { productId: 0, quantity: 1 };
+    this.form = { productId: 0, quantity: 1, userId: this.currentUserId ?? 0 };
     this.orderError = '';
+    this.api.getProducts().subscribe({
+      next: (prods) => {
+        this.products = prods;
+        this.productMap = Object.fromEntries(prods.map(p => [p.id!, p.name]));
+      }
+    });
+    if (this.isAdmin) {
+      this.api.getUsers().subscribe({
+        next: (users) => {
+          this.userMap = Object.fromEntries(users.map(u => [u.id!, u.username]));
+        }
+      });
+    }
     this.showModal = true;
   }
 
   placeOrder(): void {
-    if (!this.form.productId || !this.currentUserId || this.form.quantity < 1) return;
+    const userId = this.isAdmin ? this.form.userId : this.currentUserId;
+    if (!this.form.productId || !userId || this.form.quantity < 1) {
+      this.orderError = !userId ? 'Please select a user.' : 'Please fill in all required fields.';
+      return;
+    }
     this.placing = true;
     this.orderError = '';
 
     const request: CreateOrderRequest = {
-      userId: this.currentUserId,
+      userId: userId,
       productId: this.form.productId,
       quantity: this.form.quantity
     };

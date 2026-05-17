@@ -63,8 +63,8 @@ Full-stack microservices application with:
 | Product Service | http://localhost:8082 |
 | Order Service | http://localhost:8083 |
 | Keycloak | http://localhost:8080 |
-| Grafana | http://localhost:3000 |
-| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3001 |
+| Prometheus | http://localhost:9091 |
 
 ## Service URLs (Kubernetes / Ingress)
 
@@ -258,10 +258,22 @@ Config resolution order (highest wins):
 | `/admin` | `admin.component.ts` | ROLE_ADMIN |
 
 **Orders page behaviour:**
-- Admin: sees all orders (`GET /api/orders`) with User column resolved to username
-- Regular user: sees their own orders (`GET /api/orders/user/{id}`), user DB ID resolved by matching Keycloak username against `/api/users`
-- Place Order modal: product dropdown (out-of-stock hidden), shows price + available stock, inline error for 409 Insufficient Stock
+- Admin: sees all orders (`GET /api/orders`) with User column resolved to username; "+ Place Order" always enabled; modal includes a User dropdown to select which user the order is placed for
+- Regular user: sees their own orders (`GET /api/orders/user/{id}`), user DB ID resolved by matching Keycloak username against `/api/users`; "+ Place Order" disabled until DB profile is resolved
+- Place Order modal: refreshes product list on every open; product dropdown (out-of-stock hidden), shows price + available stock, inline error for 409 Insufficient Stock
 - Status badges: `CONFIRMED` = green, `FAILED` = red
+
+**Keycloak token reading pattern (use everywhere):**
+```typescript
+const kc = this.keycloak.getKeycloakInstance();
+// Username / email — read from ID token (access token may omit these in Keycloak 24)
+const id = kc.idTokenParsed as Record<string, unknown>;
+const username = (id?.['preferred_username'] as string) || '';
+// Roles — read from access token custom claim, deduplicate (two mappers can emit duplicates)
+const access = kc.tokenParsed as Record<string, unknown>;
+const roles = [...new Set((access?.['roles'] as string[]) ?? [])];
+const isAdmin = roles.includes('ROLE_ADMIN');
+```
 
 ---
 
@@ -303,3 +315,6 @@ Config resolution order (highest wins):
 - Do not change `config-repo/` filenames — they must match `spring.application.name` values exactly
 - Do not add `rewrite-target: /` to the K8s Ingress — it strips the path from all proxied requests
 - Do not define `SPRING_CLOUD_CONFIG_URI` before `CONFIG_SERVER_PASSWORD` in a K8s Deployment env list — `$(VAR)` substitution only resolves variables defined earlier in the list
+- Do not use `keycloak.isUserInRole()` in Angular components — it checks `realm_access.roles` which is empty for this project; read `tokenParsed['roles']` directly instead
+- Do not use `keycloak.getUsername()` — it throws unless `loadUserProfile()` has been called first; read `idTokenParsed['preferred_username']` instead
+- Do not trust `tokenParsed['roles']` without deduplicating — two active Protocol Mappers can emit the same role twice; always wrap with `[...new Set(...)]`

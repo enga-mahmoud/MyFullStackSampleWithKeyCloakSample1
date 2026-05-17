@@ -1444,15 +1444,18 @@ frontend/src/app/components/navbar/navbar.component.ts
       and then back to the app origin).
     - Uses RouterLink and RouterLinkActive for navigation with active
       link highlighting.
-    - Reads username from keycloak.getKeycloakInstance().tokenParsed
-      ['preferred_username'] rather than keycloak.getUsername(), because
-      getUsername() in keycloak-angular v16 requires loadUserProfile() to
-      be called first (which makes an extra CORS-restricted HTTP request
-      to Keycloak's account endpoint). Reading tokenParsed is instant and
-      requires no additional network calls.
-    - Checks isAdmin via keycloak.isUserInRole('ROLE_ADMIN'), which works
-      because the navbar only uses this for UI display (not for security
-      enforcement). Security is enforced by authGuard reading tokenParsed.
+    - Reads username from keycloak.getKeycloakInstance().idTokenParsed
+      ['preferred_username'] (falls back to tokenParsed) rather than
+      keycloak.getUsername(), because getUsername() in keycloak-angular v16
+      requires loadUserProfile() to be called first (extra CORS-restricted
+      HTTP request to Keycloak's account endpoint). Reading idTokenParsed is
+      instant and requires no additional network calls. idTokenParsed is
+      preferred because Keycloak 24 may omit preferred_username from the
+      access token depending on scope configuration.
+    - Checks isAdmin by reading the custom top-level 'roles' claim from
+      tokenParsed and calling .includes('ROLE_ADMIN'). Does NOT use
+      keycloak.isUserInRole(), which reads realm_access.roles and would
+      always return false for this project's Protocol Mapper setup.
 
 ---------------------------------------------------------------------
   src/app/pages/
@@ -1466,13 +1469,12 @@ frontend/src/app/pages/dashboard/dashboard.component.ts
       (conditionally) Admin pages.
     - Displays a "Token Info" card showing username, email, and all roles
       parsed directly from the Keycloak JWT — useful for debugging auth.
-    - Reads all user data (username, email, roles) directly from
-      keycloak.getKeycloakInstance().tokenParsed instead of calling
-      keycloak.loadUserProfile(). This avoids an extra HTTP request to
-      Keycloak's /account endpoint, which is restricted by CORS when
-      Keycloak is not configured to allow the Angular app's origin for
-      account API calls. The JWT already contains all needed fields
-      (preferred_username, email, roles).
+    - Reads username and email from idTokenParsed (falls back to
+      tokenParsed) and roles from tokenParsed['roles'], deduplicating
+      with Set to guard against Protocol Mappers that emit roles from
+      multiple sources. Does NOT call keycloak.loadUserProfile() or
+      keycloak.isUserInRole() — both require extra setup or read from
+      the wrong claim location for this project's Protocol Mapper.
 
 frontend/src/app/pages/users/users.component.ts
   PURPOSE : User management page.
@@ -1480,7 +1482,8 @@ frontend/src/app/pages/users/users.component.ts
     - Fetches and displays all users in a table via ApiService.getUsers().
     - Table columns: ID, Username, Email, First Name, Last Name, Created date.
     - Admin users see an Actions column with Edit and Delete buttons and
-      a "+ New User" button (isAdmin flag read from Keycloak).
+      a "+ New User" button. isAdmin is derived from tokenParsed['roles']
+      (deduplicated via Set), NOT keycloak.isUserInRole().
     - Edit and Create operations open a modal form with ngModel two-way
       binding for username, email, firstName, lastName.
     - Delete prompts for confirmation before calling ApiService.deleteUser().
@@ -1493,24 +1496,31 @@ frontend/src/app/pages/products/products.component.ts
     - Table columns: ID, Name, Description, Price (formatted as currency),
       Stock (shown in red if 0), Created date.
     - Admin users can create, edit, and delete products via a modal form
-      with name, description, price, and stock fields.
+      with name, description, price, and stock fields. isAdmin derived
+      from tokenParsed['roles'], NOT keycloak.isUserInRole().
 
 frontend/src/app/pages/orders/orders.component.ts
   PURPOSE : Order management page — browse existing orders and place new ones.
   WHAT IT DOES :
-    - Admin role: loads all orders via getOrders(); also fetches all users
-      and all products to build lookup maps so the table shows usernames
-      and product names instead of raw IDs.
+    - isAdmin derived from tokenParsed['roles'] (deduplicated via Set).
+      Username resolved from idTokenParsed['preferred_username'] to avoid
+      calling keycloak.getUsername() which throws if loadUserProfile() has
+      not been called.
+    - Admin role: loads all orders via getOrders(); fetches all users and
+      products to build lookup maps (ID → name) for the table.
     - Regular user (ROLE_USER): resolves the logged-in user's database ID
-      by matching keycloak.getUsername() against the /api/users list, then
+      by matching preferred_username against the /api/users list, then
       loads only that user's orders via getOrdersByUser(id). Shows an info
       banner when no matching DB profile is found.
-    - Displays orders in a table with columns: ID, User, Product, Quantity,
-      Total Price, Status, Created date. Status shown as a green badge
-      (CONFIRMED) or red badge (FAILED).
-    - Place Order button opens a modal form with a product dropdown
-      (filtered to in-stock products only), quantity input, and inline
-      error display for upstream failures.
+    - Displays orders in a table with columns: ID, User (admins only),
+      Product, Quantity, Total Price, Status, Created date. Status shown
+      as a green badge (CONFIRMED) or red badge (FAILED).
+    - "+ Place Order" button: enabled for admins regardless of DB profile;
+      enabled for regular users only when their DB profile is resolved.
+    - Place Order modal: refreshes the product list on every open (so
+      newly added products appear immediately). Admins see a User dropdown
+      to select which user the order is placed for; regular users use their
+      own resolved currentUserId.
     - Submits POST /api/orders via ApiService.createOrder() and refreshes
       the list on success.
     - Route: /orders, protected by authGuard with data: { roles: ['ROLE_USER'] }.

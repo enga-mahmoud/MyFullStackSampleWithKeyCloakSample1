@@ -31,7 +31,7 @@
 │        ▼                                                                        │
 │  ┌──────────┐   ┌──────────────────────────────────────────────────────────┐   │
 │  │Keycloak  │   │                  Observability Stack                      │   │
-│  │  :8080   │   │  OTel Collector → Tempo  → Grafana :3000                 │   │
+│  │  :8080   │   │  OTel Collector → Tempo  → Grafana :3001                 │   │
 │  │ (prod)   │   │  Spring Actuator → Prometheus → Grafana                  │   │
 │  └──────────┘   │  Loki Appender → Loki → Grafana                         │   │
 │        │        └──────────────────────────────────────────────────────────┘   │
@@ -145,8 +145,8 @@ MyFullStackSampleWithKeyCloackSample1/
 | Product Service | 8082 |
 | Order Service | 8083 |
 | Keycloak | 8080 |
-| Grafana | 3000 |
-| Prometheus | 9090 |
+| Grafana | 3001 |
+| Prometheus | 9091 |
 | Loki | 3100 |
 | Tempo | 3110 |
 | OTel Collector gRPC | 4317 |
@@ -427,7 +427,7 @@ docker compose ps
 # http://localhost:4200
 
 # Grafana
-# http://localhost:3000  (admin / grafana_pass)
+# http://localhost:3001  (admin / grafana_pass)
 
 # Test API
 TOKEN=$(curl -s -X POST http://localhost:8080/realms/myapp-realm/protocol/openid-connect/token \
@@ -480,7 +480,7 @@ kubectl delete -k k8s/
 | Service | URL (Docker Compose) | URL (Kubernetes) | Username | Password |
 |---|---|---|---|---|
 | Keycloak Admin | http://localhost:8080/admin | http://keycloak.local/admin | admin | Admin@1234! |
-| Grafana | http://localhost:3000 | http://grafana.local | admin | grafana_pass |
+| Grafana | http://localhost:3001 | http://grafana.local | admin | grafana_pass |
 | Config Server | http://localhost:8888 | internal only | configuser | config_pass |
 | Test user | — | — | user1 | User@1234! |
 | Test admin | — | — | admin1 | Admin@1234! |

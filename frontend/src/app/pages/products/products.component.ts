@@ -98,7 +98,9 @@ export class ProductsComponent implements OnInit {
   constructor(private api: ApiService, private keycloak: KeycloakService) {}
 
   ngOnInit(): void {
-    this.isAdmin = this.keycloak.isUserInRole('ROLE_ADMIN');
+    const token = this.keycloak.getKeycloakInstance().tokenParsed as Record<string, unknown>;
+    const roles = (token?.['roles'] as string[]) ?? [];
+    this.isAdmin = roles.includes('ROLE_ADMIN');
     this.load();
   }
 

@@ -34,8 +34,8 @@ User Service       http://localhost:8081
 Product Service    http://localhost:8082
 Order Service      http://localhost:8083
 Keycloak Admin     http://localhost:8080/admin
-Grafana            http://localhost:3000
-Prometheus         http://localhost:9090
+Grafana            http://localhost:3001
+Prometheus         http://localhost:9091
 Loki               http://localhost:3100
 Tempo              http://localhost:3110
 
