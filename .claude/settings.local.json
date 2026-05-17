@@ -9,7 +9,9 @@
       "PowerShell(Rename-Item *)",
       "Bash(Select-String -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\\\\docs.txt\" -Pattern \"^={3,}|^## |^### \")",
       "Bash(Select-Object LineNumber, Line)",
-      "Bash(Format-Table -AutoSize)"
+      "Bash(Format-Table -AutoSize)",
+      "Bash(Get-ChildItem -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\" -Recurse -Force)",
+      "Bash(Select-Object FullName)"
     ]
   }
 }
