@@ -1,0 +1,87 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas.productService }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "product-service" "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "myapp.selectorLabels" (dict "component" "product-service" "root" .) | nindent 8 }}
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgres-product 5432; do echo waiting for postgres-product; sleep 3; done']
+        - name: wait-for-config-server
+          image: busybox:1.36
+          command: ['sh', '-c', 'until wget -qO- http://config-server:8888/actuator/health; do echo waiting; sleep 5; done']
+
+      containers:
+        - name: product-service
+          image: {{ include "myapp.image" (dict "service" "product-service" "root" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8082
+          env:
+            - name: CONFIG_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-secret
+                  key: CONFIG_SERVER_PASSWORD
+            - name: SPRING_CLOUD_CONFIG_URI
+              value: {{ include "myapp.configServerUri" . }}
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://postgres-product:5432/{{ .Values.databases.productDb.name }}
+            - name: SPRING_DATASOURCE_USERNAME
+              value: {{ .Values.databases.productDb.user }}
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: product-db-secret
+                  key: PRODUCT_DB_PASSWORD
+            - name: KEYCLOAK_ISSUER_URI
+              value: {{ include "myapp.keycloakIssuerUri" . }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4317
+            - name: LOKI_URL
+              value: http://loki:3100
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8082
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8082
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.resources.microservices | nindent 12 }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "myapp.selectorLabels" (dict "component" "product-service" "root" .) | nindent 4 }}
+  ports:
+    - port: 8082
+      targetPort: 8082

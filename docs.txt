@@ -1962,3 +1962,1848 @@ CUSTOM IMAGE BUILD PROCESS:
     docker push <registry>/myapp/config-server:1.0.0
     (then update image: in the YAML manifests)
 =====================================================================
+
+
+=====================================================================
+  KUBERNETES GCP (k8s_gcp/) — GKE DEPLOYMENT FILES
+=====================================================================
+
+  The k8s_gcp/ directory contains Kubernetes manifests and helper
+  scripts tailored specifically for Google Kubernetes Engine (GKE).
+  It deploys the same 15-service stack as k8s/ and docker-compose.yml
+  but replaces local-only constructs with production-grade GCP equivalents:
+
+    LOCAL k8s/                       GCP k8s_gcp/
+    ─────────────────────────────    ─────────────────────────────────────
+    myapp/<image>:1.0.0 (local)  →  Artifact Registry image paths
+    cluster default storageClass →  standard-rwo (GKE pd-standard RWO)
+    nginx Ingress Controller      →  GKE native Ingress (Google Cloud LB)
+    ClusterIP for LB backends     →  NodePort with BackendConfig CRDs
+    No TLS                        →  Google-managed TLS (ManagedCertificate)
+    No HTTPS redirect             →  FrontendConfig (HTTP→HTTPS at LB level)
+    keycloak.local hostname        →  Real public domain (KEYCLOAK_DOMAIN)
+    http://keycloak:8080 issuer   →  https://KEYCLOAK_DOMAIN (JWT iss match)
+    No autoscaling                →  HorizontalPodAutoscaler on all services
+    No disruption budget          →  PodDisruptionBudget on critical services
+
+  PREREQUISITES:
+    - GCP account with billing enabled
+    - gcloud CLI authenticated
+    - kubectl installed and configured via gcloud
+    - Docker (for building and pushing images)
+    - Three public DNS A records pointing to the reserved static IP
+    - Domains decided for: frontend (APP_DOMAIN), Keycloak
+      (KEYCLOAK_DOMAIN), and Grafana (GRAFANA_DOMAIN)
+
+  DIRECTORY LAYOUT:
+    k8s_gcp/
+    ├── README.md                       Step-by-step GCP deployment guide
+    ├── kustomization.yaml              Master apply list (kubectl apply -k k8s_gcp/)
+    ├── 00-namespace.yaml
+    ├── 01-secrets.yaml
+    ├── configmaps/
+    │   ├── 02-config-repo-cm.yaml      Unchanged from k8s/
+    │   ├── 03-infra-configs-cm.yaml    environment label changed to "gcp"
+    │   └── 04-keycloak-realm-cm.yaml   sslRequired=external, HTTPS redirectUris
+    ├── storage/
+    │   └── 05-pvcs.yaml                storageClassName: standard-rwo
+    ├── databases/
+    │   ├── 06-postgres-keycloak.yaml
+    │   ├── 07-postgres-user.yaml
+    │   ├── 08-postgres-product.yaml
+    │   └── 09-postgres-order.yaml
+    ├── auth/
+    │   └── 10-keycloak.yaml            KC_HOSTNAME, KC_PROXY=edge
+    ├── spring-cloud/
+    │   ├── 11-config-server.yaml       Artifact Registry image
+    │   └── 12-api-gateway.yaml         KEYCLOAK_ISSUER_URI → external HTTPS
+    ├── microservices/
+    │   ├── 13-user-service.yaml
+    │   ├── 14-product-service.yaml
+    │   └── 15-order-service.yaml
+    ├── observability/
+    │   ├── 16-otel-collector.yaml
+    │   ├── 17-prometheus.yaml          securityContext: runAsNonRoot
+    │   ├── 18-loki.yaml
+    │   ├── 19-tempo.yaml
+    │   └── 20-grafana.yaml             GF_SERVER_ROOT_URL → https://GRAFANA_DOMAIN
+    ├── frontend/
+    │   └── 21-frontend.yaml            NodePort service, 2 replicas
+    ├── ingress/
+    │   ├── 22-backend-configs.yaml     BackendConfig per LB backend
+    │   ├── 23-frontend-config.yaml     FrontendConfig (HTTPS redirect)
+    │   ├── 24-managed-certs.yaml       ManagedCertificate (Google TLS)
+    │   └── 25-ingress.yaml             GKE Ingress (ingressClass: gce)
+    ├── scaling/
+    │   ├── 26-hpa.yaml                 HPA for microservices + frontend
+    │   └── 27-pdb.yaml                 PDB for all critical services
+    └── scripts/
+        ├── 00-setup-gcp.sh             One-time GCP infra creation
+        ├── 01-build-push.sh            Build and push all Docker images
+        └── 02-deploy.sh                Full rolling deployment with waits
+
+---------------------------------------------------------------------
+  GCP ACCESS — FULL STEP-BY-STEP WALKTHROUGH
+---------------------------------------------------------------------
+
+  This section covers everything from installing the tooling to
+  having the application running on GKE with HTTPS.
+
+  ── PHASE 0 : TOOL INSTALLATION ──────────────────────────────────
+
+  1. Install Google Cloud SDK (gcloud):
+       https://cloud.google.com/sdk/docs/install
+       Windows: download the installer from the page above.
+       macOS:   brew install --cask google-cloud-sdk
+       Linux:   curl https://sdk.cloud.google.com | bash
+
+  2. Verify installation:
+       gcloud version
+
+  3. Install kubectl via gcloud:
+       gcloud components install kubectl
+
+  4. Install the GKE authentication plugin:
+       gcloud components install gke-gcloud-auth-plugin
+
+  5. Verify kubectl:
+       kubectl version --client
+
+  ── PHASE 1 : GCP AUTHENTICATION ─────────────────────────────────
+
+  Log in to your Google account:
+    gcloud auth login
+
+  This opens a browser. After approving, credentials are cached at:
+    ~/.config/gcloud/credentials.db    (Linux/macOS)
+    %APPDATA%\gcloud\credentials.db    (Windows)
+
+  Set the application-default credentials (needed by SDK libraries):
+    gcloud auth application-default login
+
+  Set your active project:
+    gcloud config set project YOUR_PROJECT_ID
+
+  Verify which account and project are active:
+    gcloud config list
+
+  ── PHASE 2 : CONFIGURE PLACEHOLDER VALUES ───────────────────────
+
+  Every manifest in k8s_gcp/ uses five placeholder strings that must
+  be replaced with your actual GCP and domain values before applying.
+
+    Placeholder       Example value              Meaning
+    ─────────────     ─────────────────────────  ─────────────────────
+    REGION            us-central1                GCP region
+    PROJECT_ID        my-gcp-project             GCP project ID
+    APP_DOMAIN        app.example.com            Frontend public URL
+    KEYCLOAK_DOMAIN   keycloak.example.com       Keycloak public URL
+    GRAFANA_DOMAIN    grafana.example.com        Grafana public URL
+
+  Run this from the k8s_gcp/ directory to do a bulk substitution:
+
+    cd k8s_gcp
+    REGION=us-central1
+    PROJECT_ID=my-gcp-project
+    APP_DOMAIN=app.example.com
+    KEYCLOAK_DOMAIN=keycloak.example.com
+    GRAFANA_DOMAIN=grafana.example.com
+
+    grep -rl 'REGION\|PROJECT_ID\|APP_DOMAIN\|KEYCLOAK_DOMAIN\|GRAFANA_DOMAIN' . \
+      | xargs sed -i \
+          -e "s|REGION|${REGION}|g" \
+          -e "s|PROJECT_ID|${PROJECT_ID}|g" \
+          -e "s|APP_DOMAIN|${APP_DOMAIN}|g" \
+          -e "s|KEYCLOAK_DOMAIN|${KEYCLOAK_DOMAIN}|g" \
+          -e "s|GRAFANA_DOMAIN|${GRAFANA_DOMAIN}|g"
+
+  ── PHASE 3 : UPDATE SECRETS ─────────────────────────────────────
+
+  The defaults in 01-secrets.yaml are the same development passwords
+  used in docker-compose.yml. Replace all of them for production.
+
+  Generate a strong base64-encoded value:
+    echo -n "$(openssl rand -base64 32)" | base64    # Linux/macOS
+    [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("yourpassword")) | Out-String  # PowerShell
+
+  Secrets to update in k8s_gcp/01-secrets.yaml:
+    KC_DB_PASSWORD             — Keycloak database password
+    KEYCLOAK_ADMIN_PASSWORD    — Keycloak admin console password
+    USER_DB_PASSWORD           — user-service database password
+    PRODUCT_DB_PASSWORD        — product-service database password
+    ORDER_DB_PASSWORD          — order-service database password
+    ORDER_SERVICE_CLIENT_SECRET — must also match the "secret" field in
+                                  04-keycloak-realm-cm.yaml for the
+                                  order-service-client Keycloak client
+    CONFIG_SERVER_PASSWORD     — Config Server HTTP Basic password
+    GF_SECURITY_ADMIN_PASSWORD — Grafana admin password
+
+  IMPORTANT: After changing ORDER_SERVICE_CLIENT_SECRET, open
+    k8s_gcp/configmaps/04-keycloak-realm-cm.yaml and update the
+    matching "secret": "order-service-secret" value inside the JSON
+    so Keycloak imports the correct client secret when it starts.
+
+  ── PHASE 4 : UPDATE ANGULAR PRODUCTION ENVIRONMENT ──────────────
+
+  The Angular frontend bakes the Keycloak URL into its bundle at
+  build time via environment.prod.ts. Before building the Docker
+  image, update this file with your real GCP domain:
+
+    frontend/src/environments/environment.prod.ts:
+      export const environment = {
+        production: true,
+        keycloakUrl: 'https://YOUR_KEYCLOAK_DOMAIN',
+      };
+
+  If you skip this step the browser will send users to the wrong
+  Keycloak URL and authentication will fail.
+
+  ── PHASE 5 : RUN THE GCP SETUP SCRIPT ───────────────────────────
+
+  From the repository root:
+    bash k8s_gcp/scripts/00-setup-gcp.sh
+
+  What this script does (you can also run the commands manually):
+
+  a) Enables GCP APIs:
+       container.googleapis.com           — GKE control plane
+       artifactregistry.googleapis.com    — Docker image registry
+       compute.googleapis.com             — Static IP, networking
+       certificatemanager.googleapis.com  — Managed TLS certs
+
+  b) Creates an Artifact Registry repository named "myapp":
+       gcloud artifacts repositories create myapp \
+         --repository-format=docker \
+         --location=REGION
+
+  c) Configures Docker to authenticate to Artifact Registry:
+       gcloud auth configure-docker REGION-docker.pkg.dev
+     This writes a credential helper to ~/.docker/config.json so
+     docker push/pull authenticates automatically.
+
+  d) Creates the GKE cluster:
+       gcloud container clusters create myapp-cluster \
+         --region=REGION \
+         --num-nodes=2 \
+         --machine-type=e2-standard-4 \
+         --enable-ip-alias \
+         --enable-autoscaling \
+         --min-nodes=2 --max-nodes=6 \
+         --release-channel=regular
+     e2-standard-4 = 4 vCPU, 16 GB RAM per node.
+     --enable-ip-alias enables VPC-native networking (required for NEGs).
+     --release-channel=regular receives tested stable patches.
+
+  e) Fetches cluster credentials into the local kubeconfig:
+       gcloud container clusters get-credentials myapp-cluster \
+         --region=REGION
+     After this, kubectl commands target the GKE cluster.
+
+  f) Reserves a global static IP for the Ingress:
+       gcloud compute addresses create myapp-static-ip --global
+     Prints the IP address — you need this for the next phase.
+
+  ── PHASE 6 : DNS SETUP ──────────────────────────────────────────
+
+  Log in to your DNS provider and create three A records:
+
+    Name              Type    Value (the static IP from Phase 5)
+    ─────────────     ────    ────────────────────────────────────
+    APP_DOMAIN        A       <static-ip>
+    KEYCLOAK_DOMAIN   A       <static-ip>
+    GRAFANA_DOMAIN    A       <static-ip>
+
+  Propagation can take up to 48 hours but is usually under 10 minutes.
+  Test with: nslookup APP_DOMAIN   (should return the static IP)
+
+  Google-managed TLS certificates will not be provisioned until DNS
+  resolves to the correct static IP, so complete this step before
+  applying manifests. Certificate provisioning itself takes up to
+  60 minutes after DNS is correct.
+
+  ── PHASE 7 : BUILD AND PUSH IMAGES ─────────────────────────────
+
+  From the repository root (after completing Phase 4 for the frontend):
+    bash k8s_gcp/scripts/01-build-push.sh REGION PROJECT_ID
+
+  This builds each of the 6 custom images for linux/amd64 and pushes
+  them to Artifact Registry:
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/config-server:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/api-gateway:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/product-service:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/order-service:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/frontend:1.0.0
+
+  To build and push a single service manually:
+    docker build --platform linux/amd64 \
+      -t REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0 \
+      ./user-service
+    docker push REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0
+
+  Note: --platform linux/amd64 is required when building on an Apple
+  Silicon (ARM) Mac so the image runs on GKE's x86_64 nodes.
+
+  ── PHASE 8 : DEPLOY ─────────────────────────────────────────────
+
+  Option A — automated script (recommended):
+    bash k8s_gcp/scripts/02-deploy.sh
+    The script asks for confirmation, applies all manifests via
+    kustomize, then waits for each component in dependency order.
+
+  Option B — manual:
+    kubectl apply -k k8s_gcp/
+
+  Watch rollout progress:
+    kubectl get pods -n myapp -w
+
+  Check Ingress (GCP LB provisioning takes 5–10 minutes):
+    kubectl get ingress -n myapp
+
+  When the ADDRESS column of the Ingress shows the static IP,
+  the Google Cloud HTTP(S) LB is active and routing traffic.
+
+  ── PHASE 9 : VERIFY TLS CERTIFICATES ───────────────────────────
+
+  ManagedCertificate status:
+    kubectl describe managedcertificate myapp-cert -n myapp
+
+  Possible status values:
+    Provisioning   — Google is requesting the cert (DNS must resolve)
+    FailedNotVisible — DNS does not yet resolve to the static IP
+    Active         — TLS is working; HTTPS is live
+
+  Until status is Active the site is reachable only over HTTP
+  (the FrontendConfig redirect will enforce HTTPS once cert is Active).
+
+  ── PHASE 10 : ACCESS URLS (GCP) ─────────────────────────────────
+
+    https://APP_DOMAIN            — Angular frontend
+    https://APP_DOMAIN/api/       — API Gateway (via Ingress path routing)
+    https://KEYCLOAK_DOMAIN/admin — Keycloak Admin Console
+    https://GRAFANA_DOMAIN        — Grafana dashboards
+
+  Credentials are unchanged from the local setup (see 01-secrets.yaml):
+    Keycloak admin : admin / Admin@1234!
+    Test user      : user1 / User@1234!
+    Test admin     : admin1 / Admin@1234!
+    Grafana        : admin / grafana_pass   (change in secrets!)
+
+---------------------------------------------------------------------
+  k8s_gcp/README.md
+---------------------------------------------------------------------
+
+k8s_gcp/README.md
+  PURPOSE : Human-readable companion to this docs section. Contains
+            the same deployment phases in a compact, copy-paste-ready
+            format suitable for reading directly in the repository.
+  WHAT IT DOES :
+    - Lists all placeholder variables and a one-liner sed command to
+      bulk-replace them across all manifests.
+    - Shows all gcloud commands needed to set up GCP infrastructure.
+    - Documents the DNS A record requirements.
+    - Describes the image build and push steps.
+    - Explains how to verify the deployment and certificate status.
+    - Summarises key differences between k8s/ (local) and k8s_gcp/ (GCP)
+      in a comparison table.
+    - Covers teardown (delete cluster, release static IP).
+
+---------------------------------------------------------------------
+  k8s_gcp/kustomization.yaml
+---------------------------------------------------------------------
+
+k8s_gcp/kustomization.yaml
+  PURPOSE : Kustomize entry point that lists all 28 manifests in the
+            correct apply order for a single-command GCP deployment.
+  WHAT IT DOES :
+    - Same role as k8s/kustomization.yaml but references the GCP-specific
+      files instead.
+    - Apply with: kubectl apply -k k8s_gcp/
+    - Resources are ordered so namespace → secrets → configmaps → PVCs →
+      databases → auth → spring-cloud → microservices → observability →
+      frontend → ingress → scaling are applied in dependency order.
+
+---------------------------------------------------------------------
+  k8s_gcp/00-namespace.yaml
+---------------------------------------------------------------------
+
+k8s_gcp/00-namespace.yaml
+  PURPOSE : Creates the "myapp" namespace on GKE.
+  WHAT IT DOES :
+    - Identical in structure to k8s/00-namespace.yaml.
+    - Label environment is changed to "gcp" to distinguish from the
+      local cluster at a glance.
+
+---------------------------------------------------------------------
+  k8s_gcp/01-secrets.yaml
+---------------------------------------------------------------------
+
+k8s_gcp/01-secrets.yaml
+  PURPOSE : Declares all 8 Kubernetes Secrets for the GCP deployment.
+  WHAT IT DOES :
+    - Same 8 secrets as k8s/01-secrets.yaml (same key names, same
+      secret structure) but values are base64-encoded.
+    - Values ship as the development defaults and MUST be replaced with
+      strong random passwords before applying to GCP.
+    - All secret values are consumed via secretKeyRef in Pod env sections
+      so no password ever appears in a Deployment spec.
+    - Production recommendation: replace with Google Secret Manager +
+      External Secrets Operator so secrets are not stored in etcd
+      (GKE etcd is encrypted at rest, but Secret Manager provides
+       audit logs, versioning, and automatic rotation).
+
+---------------------------------------------------------------------
+  k8s_gcp/configmaps/
+---------------------------------------------------------------------
+
+k8s_gcp/configmaps/02-config-repo-cm.yaml
+  PURPOSE : Identical to k8s/configmaps/02-config-repo-cm.yaml.
+  WHAT IT DOES :
+    - Packages application.yml, user-service.yml, product-service.yml,
+      and order-service.yml as ConfigMap keys.
+    - Mounted into the config-server Pod at /config-repo so the Config
+      Server serves these files via its native filesystem backend.
+    - No GCP-specific changes needed: all configuration values use
+      internal Kubernetes service DNS names which are the same on GKE.
+
+k8s_gcp/configmaps/03-infra-configs-cm.yaml
+  PURPOSE : Packages all infrastructure tool configs as ConfigMaps.
+  WHAT IT DOES :
+    - Same 6 ConfigMaps as k8s/configmaps/03-infra-configs-cm.yaml:
+      prometheus-config, otel-collector-config, loki-config,
+      tempo-config, grafana-datasources, nginx-config.
+    - GCP-specific changes:
+        prometheus-config     : external_labels.environment changed
+                                from "local" to "gcp" so metrics
+                                can be filtered by environment in Grafana.
+        otel-collector-config : service.environment attribute changed
+                                from "local" to "gcp" so traces carry
+                                the correct environment label.
+        tempo-config          : external_labels.environment changed
+                                from "local" to "gcp".
+    - Internal service DNS names are identical on GKE so Prometheus
+      scrape targets, OTel exporter endpoints, and Grafana datasource
+      URLs are unchanged.
+
+k8s_gcp/configmaps/04-keycloak-realm-cm.yaml
+  PURPOSE : Packages the Keycloak realm JSON for GCP.
+  WHAT IT DOES :
+    - Same structure as k8s/configmaps/04-keycloak-realm-cm.yaml but
+      with two critical GCP-specific changes:
+        sslRequired: changed from "none" to "external".
+          "external" = HTTPS required for connections coming from outside
+          the cluster. Internal pod-to-pod connections on plain HTTP
+          (e.g. health checks from the GCP LB to the Keycloak pod) are
+          still allowed. This is the correct setting when TLS is
+          terminated at the Google Cloud HTTP(S) LB.
+        angular-client.redirectUris: changed from
+          ["http://localhost:4200/*", "http://frontend/*", "http://myapp.local/*"]
+          to ["https://APP_DOMAIN/*"]
+          so Keycloak only allows redirects back to the real GCP frontend
+          domain. Wildcard (*) allows any path under APP_DOMAIN.
+        angular-client.webOrigins: changed from localhost/myapp.local
+          to ["https://APP_DOMAIN"] so CORS is restricted to the GCP
+          frontend origin.
+    - Mounted into the Keycloak Pod at /opt/keycloak/data/import.
+      Keycloak --import-realm reads this file on first startup.
+
+---------------------------------------------------------------------
+  k8s_gcp/storage/
+---------------------------------------------------------------------
+
+k8s_gcp/storage/05-pvcs.yaml
+  PURPOSE : Declares PersistentVolumeClaims with GKE-specific storage class.
+  WHAT IT DOES :
+    - Same 8 PVCs as k8s/storage/05-pvcs.yaml but with two differences:
+        storageClassName: standard-rwo is set explicitly.
+          On GKE, "standard-rwo" provisions Google Persistent Disk
+          (pd-standard, HDD) with ReadWriteOnce access mode. This is
+          GKE's recommended class for stateful workloads.
+          Alternative: premium-rwo provisions pd-ssd (higher IOPS, ~2x cost).
+        Sizes increased to production-appropriate values:
+          Database PVCs: 5Gi (was 2Gi)
+          Observability PVCs: 10Gi each (was 5Gi)
+          Grafana PVC: 2Gi (was 1Gi)
+    - All PVCs are ReadWriteOnce — only one GKE node can mount a PD disk
+      at a time, matching single-replica StatefulSet / Deployment replicas.
+    - GKE automatically provisions the underlying Google PD when the PVC
+      is bound (dynamic provisioning via the standard-rwo StorageClass).
+
+---------------------------------------------------------------------
+  k8s_gcp/databases/
+---------------------------------------------------------------------
+
+k8s_gcp/databases/06-postgres-keycloak.yaml
+k8s_gcp/databases/07-postgres-user.yaml
+k8s_gcp/databases/08-postgres-product.yaml
+k8s_gcp/databases/09-postgres-order.yaml
+  PURPOSE : Deploy four dedicated PostgreSQL 16 instances on GKE.
+  WHAT IT DOES :
+    - Identical in logic to the k8s/databases/ equivalents.
+    - Each is a StatefulSet with a headless Service, readiness/liveness
+      probes using pg_isready, and mounts the corresponding GCP PVC.
+    - No image change needed — postgres:16-alpine is pulled from Docker Hub
+      by the GKE nodes directly (GKE nodes have internet egress).
+    - Services remain ClusterIP (headless) — databases are only accessed
+      internally by the microservices.
+
+---------------------------------------------------------------------
+  k8s_gcp/auth/
+---------------------------------------------------------------------
+
+k8s_gcp/auth/10-keycloak.yaml
+  PURPOSE : Deploys Keycloak in production mode on GKE behind the
+            Google Cloud HTTP(S) Load Balancer.
+  WHAT IT DOES :
+    - Same image: quay.io/keycloak/keycloak:24.0.4 with --import-realm.
+    - initContainer waits for postgres-keycloak TCP on port 5432.
+    - GCP-specific environment variables:
+        KC_HOSTNAME: KEYCLOAK_DOMAIN
+          Tells Keycloak what hostname to use when constructing the
+          JWT issuer URL, token endpoints, redirect URIs, and admin
+          console links. With KC_PROXY=edge and this set, Keycloak's
+          issuer will be https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+        KC_PROXY: edge
+          Informs Keycloak it is behind a reverse proxy (the GCP LB)
+          that terminates TLS. Keycloak trusts X-Forwarded-Proto and
+          X-Forwarded-Host headers from the proxy and sets its own
+          URLs to HTTPS even though it listens on plain HTTP internally.
+        KC_HTTP_ENABLED: true
+          Required because the GCP LB backend connection to the
+          Keycloak pod uses plain HTTP (TLS is terminated at the LB).
+        KC_HOSTNAME_STRICT: false
+          Allows requests using any hostname (including the internal
+          "keycloak" service DNS name) to reach the pod. If set to true,
+          only requests with the Host header matching KC_HOSTNAME would
+          succeed, breaking health checks from within the cluster.
+        KC_HOSTNAME_STRICT_HTTPS: false
+          Disables Keycloak's own HTTPS requirement — the GCP LB
+          enforces HTTPS externally; the pod itself speaks HTTP.
+    - Service type: NodePort (not ClusterIP).
+      GKE's HTTP(S) Load Balancer requires NodePort or NEG-enabled
+      services as its backends. The BackendConfig annotation links
+      this service to keycloak-backend-config for health check config.
+    - Resources increased to 500m/1Gi request, 2000m/2Gi limit because
+      Keycloak is a Java application with a large initial heap.
+
+---------------------------------------------------------------------
+  k8s_gcp/spring-cloud/
+---------------------------------------------------------------------
+
+k8s_gcp/spring-cloud/11-config-server.yaml
+  PURPOSE : Deploys the Spring Cloud Config Server on GKE.
+  WHAT IT DOES :
+    - Same logic as k8s/spring-cloud/10-config-server.yaml.
+    - Image changed to Artifact Registry path:
+        REGION-docker.pkg.dev/PROJECT_ID/myapp/config-server:1.0.0
+    - Service type: ClusterIP (not exposed externally; only Spring Boot
+      services access it internally during startup).
+    - No KEYCLOAK_ISSUER_URI needed — Config Server has no security role.
+
+k8s_gcp/spring-cloud/12-api-gateway.yaml
+  PURPOSE : Deploys the Spring Cloud Gateway on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+    - Two initContainers enforce startup ordering (same as local k8s/).
+    - KEYCLOAK_ISSUER_URI changed to https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+      This is the critical GCP difference: the API Gateway validates
+      the JWT's "iss" claim. Because Keycloak on GCP uses KC_HOSTNAME=
+      KEYCLOAK_DOMAIN and KC_PROXY=edge, it puts "https://KEYCLOAK_DOMAIN/
+      realms/myapp-realm" in the "iss" claim. The issuer URI in Spring
+      Security must match exactly — using the internal http://keycloak:8080
+      URL would cause JWT validation failures.
+    - Service type: NodePort with BackendConfig annotation so the GCP LB
+      health-checks /actuator/health:8090 instead of /.
+    - Resources increased to 200m/512Mi request, 800m/1Gi limit.
+
+---------------------------------------------------------------------
+  k8s_gcp/microservices/
+---------------------------------------------------------------------
+
+k8s_gcp/microservices/13-user-service.yaml
+  PURPOSE : Deploys user-service on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+    - KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm
+      (must match the iss claim in tokens for JWT validation).
+    - Service type: ClusterIP — user-service is not directly exposed
+      to the internet; all external traffic arrives via the API Gateway.
+    - initContainers wait for postgres-user:5432 and config-server health.
+
+k8s_gcp/microservices/14-product-service.yaml
+  PURPOSE : Deploys product-service on GKE.
+  WHAT IT DOES :
+    - Identical in structure to 13-user-service.yaml.
+    - KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+    - Service type: ClusterIP.
+
+k8s_gcp/microservices/15-order-service.yaml
+  PURPOSE : Deploys order-service on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+    - Three initContainers: wait for postgres-order, config-server,
+      and keycloak (because order-service fetches machine tokens at
+      runtime, it needs Keycloak to be ready before it starts).
+    - KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm
+      (for validating inbound user JWTs — must match iss claim).
+    - KEYCLOAK_TOKEN_URI: http://keycloak:8080/realms/myapp-realm/
+      protocol/openid-connect/token
+      Uses the internal cluster URL (not the public HTTPS one) for
+      service-to-service client_credentials token fetches. This avoids
+      sending machine tokens through the public internet and eliminates
+      the latency of a round-trip through the Google Cloud LB.
+      The resulting tokens still carry "iss: https://KEYCLOAK_DOMAIN/..."
+      because Keycloak uses KC_HOSTNAME for the claim regardless of
+      which endpoint issued the token.
+    - ORDER_SERVICE_CLIENT_SECRET from order-client-secret Secret.
+    - Service type: ClusterIP.
+
+---------------------------------------------------------------------
+  k8s_gcp/observability/
+---------------------------------------------------------------------
+
+k8s_gcp/observability/16-otel-collector.yaml
+  PURPOSE : Deploys the OTel Collector on GKE.
+  WHAT IT DOES :
+    - Same as k8s/observability/14-otel-collector.yaml.
+    - Service type: ClusterIP. Not exposed externally.
+    - Mounts otel-collector-config ConfigMap (environment label = "gcp").
+
+k8s_gcp/observability/17-prometheus.yaml
+  PURPOSE : Deploys Prometheus on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=65534, runAsNonRoot=true,
+      fsGroup=65534 so Prometheus can write to the PVC without
+      requiring root (GKE enforces this on hardened node pools).
+    - readinessProbe hits /-/ready and livenessProbe hits /-/healthy
+      (Prometheus-native health endpoints, more reliable than the
+      default path / which serves the Prometheus UI).
+    - Service type: ClusterIP. Scraped internally by Grafana.
+
+k8s_gcp/observability/18-loki.yaml
+  PURPOSE : Deploys Grafana Loki on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=10001 (Loki's dedicated UID).
+    - readinessProbe hits /ready (Loki's built-in readiness endpoint).
+    - Service type: ClusterIP.
+
+k8s_gcp/observability/19-tempo.yaml
+  PURPOSE : Deploys Grafana Tempo on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=10001.
+    - readinessProbe hits /ready.
+    - Mounts tempo-config ConfigMap with subPath: tempo.yaml.
+    - Service type: ClusterIP.
+
+k8s_gcp/observability/20-grafana.yaml
+  PURPOSE : Deploys Grafana on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=472 (Grafana's dedicated UID).
+    - GCP-specific addition: GF_SERVER_ROOT_URL = https://GRAFANA_DOMAIN.
+      This tells Grafana its externally visible URL, which is used in
+      share links, OAuth redirects, and email alerts.
+    - readinessProbe hits /api/health (Grafana's REST health endpoint).
+    - Service type: NodePort with cloud.google.com/backend-config
+      annotation so the GCP LB health-checks /api/health:3000.
+
+---------------------------------------------------------------------
+  k8s_gcp/frontend/
+---------------------------------------------------------------------
+
+k8s_gcp/frontend/21-frontend.yaml
+  PURPOSE : Deploys the Angular SPA served by nginx on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+      IMPORTANT: the image must be built from a frontend/Dockerfile after
+      updating environment.prod.ts with the real KEYCLOAK_DOMAIN.
+    - replicas: 2 instead of 1 for basic availability (HPA manages further
+      scaling from this baseline).
+    - readinessProbe and livenessProbe hit /index.html so the LB only
+      routes traffic to nginx pods that are serving the Angular bundle.
+    - Mounts nginx-config ConfigMap at /etc/nginx/conf.d for the SPA
+      fallback and /api/ proxy configuration.
+    - Service type: NodePort with cloud.google.com/backend-config
+      annotation so the GCP LB health-checks /index.html:80.
+
+---------------------------------------------------------------------
+  k8s_gcp/ingress/
+---------------------------------------------------------------------
+
+k8s_gcp/ingress/22-backend-configs.yaml
+  PURPOSE : Defines GKE BackendConfig CRDs to configure Google Cloud
+            LB health checks for each Ingress backend service.
+  WHAT IT DOES :
+    - BackendConfig is a GKE-specific CRD (cloud.google.com/v1).
+      Without it, the Google Cloud LB sends health check probes to
+      GET / on the service port. This returns 4xx for Spring Boot
+      (no handler at /), 302 for Keycloak (redirects to /auth), and
+      200 for nginx (serves index.html but this is coincidence).
+      BackendConfig overrides the health check path per service:
+        frontend-backend-config    : GET /index.html on port 80
+        api-gateway-backend-config : GET /actuator/health on port 8090
+        keycloak-backend-config    : GET /health/ready on port 8080
+        grafana-backend-config     : GET /api/health on port 3000
+    - Also configures timeoutSec (how long the LB waits for a response)
+      and drainingTimeoutSec (how long the LB waits before removing a
+      backend from rotation during a rolling update).
+    - Each BackendConfig is linked to its Service via the annotation:
+        cloud.google.com/backend-config: '{"default": "<config-name>"}'
+      on the Service itself (not on the Pod or Deployment).
+
+k8s_gcp/ingress/23-frontend-config.yaml
+  PURPOSE : Defines a GKE FrontendConfig CRD to enforce HTTP→HTTPS
+            redirect at the Google Cloud LB layer.
+  WHAT IT DOES :
+    - FrontendConfig is a GKE-specific CRD (networking.gke.io/v1beta1).
+    - redirectToHttps.enabled: true instructs the GCP LB to respond
+      with 301 Moved Permanently to any HTTP request, sending the
+      client to the HTTPS equivalent URL.
+    - This redirect happens at the load balancer before any request
+      reaches a pod — no application code change needed.
+    - Linked to the Ingress via annotation:
+        networking.gke.io/v1beta1.FrontendConfig: "myapp-frontend-config"
+
+k8s_gcp/ingress/24-managed-certs.yaml
+  PURPOSE : Provisions Google-managed SSL/TLS certificates for all
+            three public domains via a ManagedCertificate CRD.
+  WHAT IT DOES :
+    - ManagedCertificate (networking.gke.io/v1) tells GCP to request
+      and automatically renew a TLS certificate from Google's CA for
+      the listed domain names.
+    - All three domains (APP_DOMAIN, KEYCLOAK_DOMAIN, GRAFANA_DOMAIN)
+      are included in a single certificate.
+    - Provisioning requires:
+        1. The domains' DNS A records resolve to the static IP.
+        2. The Ingress is created and references this ManagedCertificate.
+    - Once provisioned (status: Active), GCP handles renewal automatically
+      — there is no need for cert-manager or Let's Encrypt.
+    - Linked to the Ingress via annotation:
+        networking.gke.io/managed-certificates: "myapp-cert"
+
+k8s_gcp/ingress/25-ingress.yaml
+  PURPOSE : Creates the Google Cloud HTTP(S) Load Balancer that routes
+            public traffic to frontend, api-gateway, keycloak, and grafana.
+  WHAT IT DOES :
+    - Ingress class: gce — uses the GKE-native Ingress controller which
+      creates a Google Cloud HTTP(S) LB (not nginx).
+    - Annotation kubernetes.io/ingress.global-static-ip-name: myapp-static-ip
+      assigns the reserved static IP to this LB so the IP never changes
+      across LB recreations.
+    - Annotation networking.gke.io/managed-certificates: myapp-cert
+      links the ManagedCertificate — GCP attaches the provisioned TLS
+      cert to the LB's HTTPS frontend.
+    - Annotation networking.gke.io/v1beta1.FrontendConfig: myapp-frontend-config
+      links the FrontendConfig — enables HTTP→HTTPS redirect.
+    - Path routing rules:
+        APP_DOMAIN/api  → api-gateway NodePort service (port 8090)
+        APP_DOMAIN/     → frontend NodePort service    (port 80)
+        KEYCLOAK_DOMAIN → keycloak NodePort service    (port 8080)
+        GRAFANA_DOMAIN  → grafana NodePort service     (port 3000)
+    - IMPORTANT: the api-gateway rule is listed before the / rule so
+      /api requests are matched first (more specific path wins).
+    - The GCP LB provisions in 5–10 minutes after first apply.
+      During provisioning the ADDRESS column of kubectl get ingress shows
+      no value. Once it shows the static IP, routing is active.
+
+---------------------------------------------------------------------
+  k8s_gcp/scaling/
+---------------------------------------------------------------------
+
+k8s_gcp/scaling/26-hpa.yaml
+  PURPOSE : Defines HorizontalPodAutoscalers for all stateless services.
+  WHAT IT DOES :
+    - Creates 5 HPAs targeting api-gateway, user-service, product-service,
+      order-service, and frontend Deployments.
+    - Uses autoscaling/v2 API (supports multiple metric types).
+    - Scales based on two metrics simultaneously:
+        CPU utilization target: 70%
+        Memory utilization target: 80%
+      When either threshold is crossed the HPA adds replicas up to maxReplicas.
+    - Scale ranges:
+        api-gateway, microservices: 1 min → 4 max replicas
+        frontend: 2 min → 6 max replicas (starts at 2 for basic HA)
+    - Requires GKE Metrics Server (enabled by default on GKE Standard
+      and Autopilot). Verify with: kubectl top pods -n myapp
+
+k8s_gcp/scaling/27-pdb.yaml
+  PURPOSE : Defines PodDisruptionBudgets to maintain availability during
+            voluntary disruptions (node upgrades, cluster maintenance).
+  WHAT IT DOES :
+    - Creates 7 PDBs for: api-gateway, user-service, product-service,
+      order-service, keycloak, frontend, config-server.
+    - minAvailable: 1 guarantees at least one pod of each service stays
+      running when nodes are drained for upgrades or preemption.
+    - Without PDBs, a node drain could simultaneously terminate all pods
+      of a single-replica service, causing downtime.
+    - PDBs protect only against voluntary disruptions. Involuntary
+      disruptions (hardware failure, OOM kill) are not covered.
+
+---------------------------------------------------------------------
+  k8s_gcp/scripts/
+---------------------------------------------------------------------
+
+k8s_gcp/scripts/00-setup-gcp.sh
+  PURPOSE : One-time GCP infrastructure setup script.
+  WHAT IT DOES :
+    - Runs gcloud auth login and sets the active project.
+    - Enables all required GCP APIs in one batch call.
+    - Creates the Artifact Registry repository named "myapp" in the
+      configured region.
+    - Runs gcloud auth configure-docker to write a credential helper
+      to ~/.docker/config.json for the Artifact Registry hostname.
+    - Creates a GKE Standard cluster with autoscaling (min 2, max 6
+      nodes), IP aliasing, and the "regular" release channel.
+    - Fetches cluster credentials via gcloud container clusters
+      get-credentials so kubectl is immediately usable.
+    - Reserves a global static IP (myapp-static-ip) for the Ingress.
+    - Prints the static IP at the end with instructions for DNS setup.
+  USAGE :
+    Edit the variables at the top (PROJECT_ID, REGION, etc.) then:
+      bash k8s_gcp/scripts/00-setup-gcp.sh
+
+k8s_gcp/scripts/01-build-push.sh
+  PURPOSE : Builds all 6 custom Docker images and pushes them to
+            Artifact Registry.
+  WHAT IT DOES :
+    - Accepts REGION, PROJECT_ID, and optional TAG as positional args.
+    - Iterates over all 6 services: config-server, api-gateway,
+      user-service, product-service, order-service, frontend.
+    - Builds each with --platform linux/amd64 (required on ARM Macs
+      to produce images that run on GKE's x86_64 nodes).
+    - Frontend is built with --build-arg BUILD_CONFIGURATION=production
+      which the Dockerfile uses to run ng build --configuration production,
+      baking in environment.prod.ts values (including KEYCLOAK_DOMAIN).
+    - Pushes each image immediately after building.
+    - Fails fast (set -euo pipefail) — if any build or push fails the
+      script stops rather than continuing with broken images.
+  USAGE :
+    bash k8s_gcp/scripts/01-build-push.sh us-central1 my-gcp-project
+    bash k8s_gcp/scripts/01-build-push.sh us-central1 my-gcp-project 2.0.0
+
+k8s_gcp/scripts/02-deploy.sh
+  PURPOSE : Applies all manifests and waits for each component to
+            reach a healthy state in dependency order.
+  WHAT IT DOES :
+    - Reads the current kubectl context and asks for confirmation so you
+      can verify you are targeting the correct GKE cluster before any
+      changes are made.
+    - Runs kubectl apply -k with the k8s_gcp/ directory.
+    - Waits for StatefulSets (databases) first, then Keycloak, then
+      Config Server, then all Spring Boot services, then observability,
+      then frontend. This matches the runtime dependency chain.
+    - After deployment, prints Ingress status (GCP LB provisioning
+      takes 5–10 minutes) and ManagedCertificate status (certificate
+      provisioning takes up to 60 minutes after DNS resolves).
+    - Prints all pod statuses at the end.
+  USAGE :
+    bash k8s_gcp/scripts/02-deploy.sh
+
+---------------------------------------------------------------------
+  CONCEPT: GKE INGRESS vs. NGINX INGRESS
+---------------------------------------------------------------------
+
+  LOCAL k8s/ uses the nginx Ingress Controller:
+    - An nginx Pod inside the cluster intercepts requests coming
+      through a NodePort or LoadBalancer Service.
+    - Configuration: ingressClassName: nginx or annotation
+      kubernetes.io/ingress.class: "nginx".
+    - Health checks: nginx proxies to any backend that has Ready pods.
+    - TLS: managed by cert-manager or manual Secret with a PEM cert.
+    - Static IP: not reserved; the LoadBalancer Service IP changes
+      unless specifically requested.
+
+  GCP k8s_gcp/ uses the GKE native Ingress (class: gce):
+    - No in-cluster proxy. GKE programs a Google Cloud HTTP(S) Load
+      Balancer (an external GCP resource) directly from the Ingress spec.
+    - Health checks: the GCP LB health-probes backend services directly
+      via NEGs or NodePort. Without BackendConfig, it probes GET / on
+      the node port. BackendConfig overrides this with correct paths.
+    - TLS: ManagedCertificate CRD delegates to Google's CA. No cert-manager.
+    - Static IP: reserved with gcloud compute addresses create --global
+      and referenced in the Ingress annotation.
+    - Backend services must be type NodePort (not ClusterIP) because
+      the GCP LB routes to individual node IPs and ports.
+    - FrontendConfig CRD adds LB-level features (HTTPS redirect, SSL policy)
+      not available via standard Ingress annotations.
+
+---------------------------------------------------------------------
+  CONCEPT: JWT ISSUER URI ON GCP
+---------------------------------------------------------------------
+
+  WHY THE ISSUER URI CHANGES FROM LOCAL TO GCP:
+
+  In Docker Compose and the local k8s/, Keycloak is configured without
+  KC_HOSTNAME. It defaults to using the internal hostname as the issuer,
+  producing tokens with:
+    "iss": "http://keycloak:8080/realms/myapp-realm"
+
+  Spring Boot services set KEYCLOAK_ISSUER_URI=http://keycloak:8080/...
+  which matches the iss claim — JWT validation succeeds.
+
+  On GCP with KC_HOSTNAME=KEYCLOAK_DOMAIN and KC_PROXY=edge, Keycloak
+  sets its own issuer to the external HTTPS domain:
+    "iss": "https://KEYCLOAK_DOMAIN/realms/myapp-realm"
+
+  Spring Boot's resource server validates the iss claim against
+  spring.security.oauth2.resourceserver.jwt.issuer-uri. If this is
+  still set to http://keycloak:8080/... the validation fails with:
+    "The iss claim is not valid"
+
+  Therefore all Spring Boot services in k8s_gcp/ set:
+    KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm
+
+  INTERNAL TOKEN FETCH (order-service only):
+  The KEYCLOAK_TOKEN_URI for client_credentials uses the internal URL:
+    http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/token
+  The resulting tokens still carry the correct external iss claim because
+  Keycloak uses KC_HOSTNAME regardless of which endpoint was called.
+  Using the internal URL avoids sending machine credentials through the
+  public internet and eliminates the GCP LB round-trip latency.
+
+---------------------------------------------------------------------
+  CONCEPT: BackendConfig HEALTH CHECKS
+---------------------------------------------------------------------
+
+  The Google Cloud HTTP(S) LB periodically probes each backend service
+  to determine pod health. By default it sends GET / to the node port
+  of every backend. This breaks Spring Boot and Keycloak:
+
+    Spring Boot (/):  no handler registered → 404 Not Found
+    Keycloak (/):     redirects to /auth     → 302 → LB marks UNHEALTHY
+    Grafana (/):      serves a redirect      → 302 → LB marks UNHEALTHY
+    nginx (/):        serves index.html      → 200 → works by coincidence
+
+  BackendConfig overrides the probe path per service:
+    frontend    → /index.html         (200 when nginx is serving)
+    api-gateway → /actuator/health    (200 when Spring Boot is UP)
+    keycloak    → /health/ready       (200 when realm is imported)
+    grafana     → /api/health         (200 from Grafana's REST API)
+
+  BackendConfig is linked to a Service via annotation on the Service:
+    cloud.google.com/backend-config: '{"default": "<config-name>"}'
+
+---------------------------------------------------------------------
+  KUBERNETES GCP — HOW THE PIECES FIT TOGETHER
+---------------------------------------------------------------------
+
+STARTUP ORDER (enforced by initContainers):
+  1. Namespace, Secrets, ConfigMaps, PVCs created by kustomize apply
+  2. postgres-keycloak, postgres-user, postgres-product, postgres-order
+     StatefulSets start in parallel — GKE dynamically provisions PDs
+  3. keycloak Deployment starts (initContainer polls postgres-keycloak:5432)
+  4. config-server Deployment starts independently
+  5. api-gateway, user-service, product-service, order-service start
+     in parallel (each initContainer waits for config-server + DB + keycloak)
+  6. Observability stack starts in parallel
+  7. frontend starts with 2 replicas
+  8. GKE programs the Google Cloud LB from the Ingress spec
+  9. ManagedCertificate provisioning begins (requires DNS to be set)
+
+GCP LB ROUTING FLOW (after Ingress is Active):
+  Browser → https://APP_DOMAIN/api/orders
+  → Google Cloud LB (terminates TLS, checks BackendConfig health)
+  → api-gateway NodePort → api-gateway Pod:8090
+  → api-gateway validates JWT (iss: https://KEYCLOAK_DOMAIN/...)
+  → TokenRelay filter copies JWT
+  → order-service:8083/api/orders
+  → order-service validates JWT again (defense in depth)
+
+  Browser → https://APP_DOMAIN/dashboard
+  → Google Cloud LB → frontend NodePort → nginx Pod:80
+  → nginx serves /index.html (SPA fallback)
+  → Angular router renders DashboardComponent
+
+AUTOSCALING FLOW:
+  Traffic spike → CPU > 70% on api-gateway Pods
+  → HPA increases replicas from 1 to 2 (then 3, then max 4)
+  → GKE schedules new Pods; BackendConfig health check confirms readiness
+  → GCP LB adds new Pods to the backend pool
+  → Traffic decreases → CPU < 70% sustained for cooldown period
+  → HPA scales down
+
+DNS IN-CLUSTER (unchanged from local k8s/):
+  Internal calls still use short Kubernetes service DNS:
+    postgres-keycloak → jdbc:postgresql://postgres-keycloak:5432/keycloak
+    keycloak          → http://keycloak:8080 (health checks, token fetch)
+    config-server     → http://config-server:8888
+    otel-collector    → http://otel-collector:4317
+    loki              → http://loki:3100
+  External calls use real domains:
+    JWT iss claim validation → https://KEYCLOAK_DOMAIN/realms/myapp-realm
+
+COMMON GKE OPERATIONS:
+  Get all pods:
+    kubectl get pods -n myapp
+
+  Watch a rolling update:
+    kubectl rollout status deployment/user-service -n myapp
+
+  Tail logs:
+    kubectl logs -n myapp deployment/user-service -f
+
+  Check Ingress and LB IP:
+    kubectl get ingress -n myapp
+
+  Check certificate status:
+    kubectl describe managedcertificate myapp-cert -n myapp
+
+  Scale a deployment manually:
+    kubectl scale deployment/user-service --replicas=3 -n myapp
+
+  Exec into a running pod:
+    kubectl exec -it -n myapp deployment/keycloak -- /bin/bash
+
+  Restart a deployment (picks up new ConfigMap values):
+    kubectl rollout restart deployment/user-service -n myapp
+
+  Update a single image after push:
+    kubectl set image deployment/user-service \
+      user-service=REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.1 \
+      -n myapp
+
+  Check HPA status:
+    kubectl get hpa -n myapp
+
+  Check PDB status:
+    kubectl get pdb -n myapp
+
+  View resource usage:
+    kubectl top pods -n myapp
+
+  Delete all resources (teardown):
+    kubectl delete -k k8s_gcp/
+    gcloud container clusters delete myapp-cluster --region=REGION
+    gcloud compute addresses delete myapp-static-ip --global
+=====================================================================
+
+
+=====================================================================
+HELM GCP (helm_gcp/) — HELM CHART FOR GKE DEPLOYMENT
+=====================================================================
+
+PURPOSE
+-------
+helm_gcp/ is a single Helm chart (not an umbrella chart) that packages
+the entire 15-service stack — including infrastructure, microservices,
+observability, ingress, autoscaling, and PodDisruptionBudgets — into
+one deployable unit for Google Kubernetes Engine (GKE).
+
+Key advantages over raw kubectl manifests (k8s_gcp/):
+  - Single install / upgrade / rollback command
+  - All domain names, image tags, replica counts, and resource limits
+    are centralized in values.yaml — no sed / envsubst needed
+  - Atomic upgrades with --atomic (auto-rollback on failure)
+  - Versioned release history: helm history myapp
+  - Conditional rendering (HPA and PDB wrapped in {{- if .Values... }})
+  - Clean uninstall: helm uninstall removes all managed resources
+
+DIRECTORY STRUCTURE
+-------------------
+helm_gcp/
+├── Chart.yaml                         Chart metadata
+├── values.yaml                        All configurable defaults
+├── values.secrets.yaml.example        Template for secrets override file
+├── .helmignore                        Files excluded from packaging
+├── templates/
+│   ├── _helpers.tpl                   Named template library
+│   ├── NOTES.txt                      Post-install instructions
+│   ├── namespace.yaml                 Namespace definition
+│   ├── secrets.yaml                   8 Kubernetes Secret objects
+│   ├── configmaps/
+│   │   ├── config-repo-cm.yaml        Spring Cloud Config native source
+│   │   ├── keycloak-realm-cm.yaml     Keycloak realm JSON (with Helm values)
+│   │   └── infra-configs-cm.yaml      Prometheus / Loki / Tempo / OTel / Grafana configs
+│   ├── storage/
+│   │   └── pvcs.yaml                  8 PersistentVolumeClaims
+│   ├── databases/
+│   │   ├── postgres-keycloak.yaml     Keycloak PostgreSQL StatefulSet + headless Service
+│   │   ├── postgres-user.yaml         user-service PostgreSQL StatefulSet + headless Service
+│   │   ├── postgres-product.yaml      product-service PostgreSQL StatefulSet + headless Service
+│   │   └── postgres-order.yaml        order-service PostgreSQL StatefulSet + headless Service
+│   ├── auth/
+│   │   └── keycloak.yaml             Keycloak Deployment + NodePort Service
+│   ├── spring-cloud/
+│   │   ├── config-server.yaml        Config Server Deployment + ClusterIP Service
+│   │   └── api-gateway.yaml          API Gateway Deployment + NodePort Service
+│   ├── microservices/
+│   │   ├── user-service.yaml         User Service Deployment + ClusterIP Service
+│   │   ├── product-service.yaml      Product Service Deployment + ClusterIP Service
+│   │   └── order-service.yaml        Order Service Deployment + ClusterIP Service
+│   ├── observability/
+│   │   ├── otel-collector.yaml       OpenTelemetry Collector Deployment + ClusterIP Service
+│   │   ├── prometheus.yaml           Prometheus Deployment + ClusterIP Service
+│   │   ├── loki.yaml                 Loki Deployment + ClusterIP Service
+│   │   ├── tempo.yaml                Tempo Deployment + ClusterIP Service
+│   │   └── grafana.yaml              Grafana Deployment + NodePort Service
+│   ├── frontend/
+│   │   └── frontend.yaml             Angular/nginx Deployment + NodePort Service
+│   ├── ingress/
+│   │   ├── backend-configs.yaml      4 BackendConfig CRDs (GCP health checks)
+│   │   ├── frontend-config.yaml      FrontendConfig CRD (HTTP→HTTPS redirect)
+│   │   ├── managed-certs.yaml        ManagedCertificate CRD (Google-managed TLS)
+│   │   └── ingress.yaml              GKE Ingress (Google Cloud HTTP(S) LB)
+│   └── scaling/
+│       ├── hpa.yaml                  5 HorizontalPodAutoscalers
+│       └── pdb.yaml                  7 PodDisruptionBudgets
+└── scripts/
+    ├── install.sh                    First-time Helm install on GKE
+    ├── upgrade.sh                    Helm upgrade for image/config changes
+    └── uninstall.sh                  Helm uninstall (PVC-preserving by default)
+
+=====================================================================
+FILE-BY-FILE DOCUMENTATION
+=====================================================================
+
+helm_gcp/Chart.yaml
+  PURPOSE : Helm chart descriptor.
+  WHAT IT DOES :
+    - apiVersion: v2 (Helm 3 only).
+    - type: application (not library).
+    - version: 1.0.0 — chart version, bump when chart structure changes.
+    - appVersion: "1.0.0" — application version, displayed in helm list.
+    - No external chart dependencies (all resources are self-contained templates).
+
+helm_gcp/values.yaml
+  PURPOSE : Single source of truth for all configurable values.
+  SECTIONS :
+    gcp:
+      region, projectId, artifactRegistry.repository, staticIpName.
+      Drives the myapp.image helper: REGION-docker.pkg.dev/PROJECT_ID/REPO/SERVICE:TAG.
+
+    domain:
+      app, keycloak, grafana.
+      Used in Ingress rules, ManagedCertificate domains, GF_SERVER_ROOT_URL,
+      Keycloak KC_HOSTNAME, KEYCLOAK_ISSUER_URI, realm redirectUris/webOrigins.
+
+    image:
+      tag: "1.0.0" — image tag for all 6 custom images.
+      pullPolicy: IfNotPresent.
+
+    secrets:
+      base64-encoded placeholder values (development defaults only).
+      All 9 secrets: keycloakDbPassword, keycloakAdmin, keycloakAdminPassword,
+      userDbPassword, productDbPassword, orderDbPassword, orderClientSecret,
+      configServerPassword, grafanaAdminPassword.
+      MUST be overridden via values.secrets.yaml before deploying.
+
+    storage:
+      class: standard-rwo (GKE pd-standard, ReadWriteOnce).
+      sizes: 5Gi for each Postgres PVC; 10Gi for Prometheus/Loki/Tempo; 2Gi for Grafana.
+
+    replicas:
+      Starting replica counts for all 12 Deployments. HPA overrides these at runtime.
+
+    resources:
+      Per-component CPU/memory requests and limits:
+        keycloak: 500m/1Gi req → 2000m/2Gi limit
+        microservices (api-gateway, user/product/order-service): 200m/512Mi → 800m/1Gi
+        configServer: 150m/384Mi → 500m/512Mi
+        postgres: 100m/256Mi → 500m/512Mi
+        frontend: 50m/64Mi → 200m/128Mi
+        otelCollector: 100m/128Mi → 300m/256Mi
+        prometheus: 200m/512Mi → 1000m/2Gi
+        loki: 100m/256Mi → 500m/512Mi
+        tempo: 100m/256Mi → 500m/512Mi
+        grafana: 100m/256Mi → 500m/512Mi
+
+    autoscaling:
+      enabled: true — wraps all HPA resources in {{- if .Values.autoscaling.enabled }}.
+      microservices: minReplicas=1, maxReplicas=4, cpuUtilization=70, memoryUtilization=80.
+      frontend: minReplicas=2, maxReplicas=6, cpuUtilization=70.
+
+    podDisruptionBudget:
+      enabled: true — wraps all PDB resources.
+      minAvailable: 1.
+
+    keycloak:
+      realm: myapp-realm.
+      db.name: keycloak, db.user: keycloak.
+
+    databases:
+      userDb, productDb, orderDb — name and user for each PostgreSQL database.
+
+helm_gcp/values.secrets.yaml.example
+  PURPOSE : Template showing the structure of the secrets override file.
+  WHAT IT DOES :
+    - Documents all 9 secret keys under the secrets: key.
+    - Instructs users to base64-encode real passwords (echo -n "pass" | base64).
+    - Must be copied to values.secrets.yaml (gitignored) before deploying.
+    - Used with: helm install myapp ./helm_gcp --values values.secrets.yaml
+
+helm_gcp/.helmignore
+  PURPOSE : Excludes files from helm package / helm install file bundling.
+  EXCLUDES : values.secrets.yaml (never package secrets), .DS_Store, *.tgz,
+             .git/, .idea/, *.orig.
+
+helm_gcp/templates/_helpers.tpl
+  PURPOSE : Named template library shared across all chart templates.
+  DEFINES :
+    myapp.name        — chart name, respects .Values.nameOverride.
+    myapp.chart       — "chart-version" string for helm.sh/chart label.
+    myapp.labels      — standard 4-label block: helm.sh/chart,
+                        app.kubernetes.io/managed-by, instance, version.
+    myapp.selectorLabels — takes dict "component" + "root"; outputs
+                        app: <component> and app.kubernetes.io/instance labels.
+                        Used for both selector.matchLabels and pod template labels.
+    myapp.image       — takes dict "service" + "root"; returns full Artifact
+                        Registry image path:
+                        REGION-docker.pkg.dev/PROJECT_ID/REPO/SERVICE:TAG
+    myapp.keycloakIssuerUri — returns https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+                        Must be HTTPS with the external domain because KC_PROXY=edge
+                        causes Keycloak to issue tokens with iss: https://...,
+                        so Spring Boot's JWT validation will fail with http:// URIs.
+    myapp.keycloakTokenUri  — returns http://keycloak:8080/realms/myapp-realm/...token.
+                        Internal URL used by order-service for client_credentials token
+                        fetch. Avoids public LB round-trip for machine-to-machine auth.
+    myapp.configServerUri   — returns http://configuser:$(CONFIG_SERVER_PASSWORD)@
+                        config-server:8888. Uses Kubernetes env var substitution
+                        syntax ($(VAR)) not Helm; rendered as a literal string.
+
+helm_gcp/templates/NOTES.txt
+  PURPOSE : Displayed to the user in the terminal immediately after helm install.
+  CONTAINS :
+    - URLs for all three public endpoints (app, keycloak, grafana).
+    - Static IP retrieval command.
+    - DNS A record setup instructions.
+    - ManagedCertificate status check command.
+    - Pod monitoring command.
+    - Credentials (Keycloak admin, Grafana admin, test users).
+    - Next steps: import realm, create test users.
+
+helm_gcp/templates/namespace.yaml
+  PURPOSE : Creates the myapp Kubernetes namespace.
+  WHAT IT DOES :
+    - Uses {{ .Release.Namespace }} so the namespace matches whatever -n flag
+      is passed to helm install (defaults to myapp).
+    - Labels with standard myapp.labels.
+
+helm_gcp/templates/secrets.yaml
+  PURPOSE : Creates all 8 Kubernetes Secret objects needed by the stack.
+  SECRETS CREATED :
+    keycloak-db-secret    → KC_DB_PASSWORD
+    keycloak-admin-secret → KEYCLOAK_ADMIN, KEYCLOAK_ADMIN_PASSWORD
+    user-db-secret        → USER_DB_PASSWORD
+    product-db-secret     → PRODUCT_DB_PASSWORD
+    order-db-secret       → ORDER_DB_PASSWORD
+    order-client-secret   → ORDER_SERVICE_CLIENT_SECRET
+    config-server-secret  → CONFIG_SERVER_PASSWORD
+    grafana-secret        → GF_SECURITY_ADMIN_PASSWORD
+  VALUES : All sourced from .Values.secrets.* (base64-encoded, passed via
+    values.secrets.yaml override).
+
+helm_gcp/templates/configmaps/config-repo-cm.yaml
+  PURPOSE : Embeds the Spring Cloud Config native source files.
+  WHAT IT DOES :
+    - Single ConfigMap named config-repo containing all *.yml files from
+      config-repo/ as data keys.
+    - Mounted at /config-repo in the config-server container.
+    - File names must match spring.application.name values exactly.
+    - Includes: application.yml (shared), user-service.yml, product-service.yml,
+      order-service.yml, api-gateway.yml.
+
+helm_gcp/templates/configmaps/keycloak-realm-cm.yaml
+  PURPOSE : Provides the Keycloak realm JSON for auto-import on startup.
+  GCP-SPECIFIC DIFFERENCES from the local k8s/ version:
+    - sslRequired: "external" — Keycloak enforces HTTPS for external requests.
+    - redirectUris: ["https://{{ .Values.domain.app }}/*"] — uses Helm value so
+      the actual public domain is baked in at helm install time.
+    - webOrigins: ["https://{{ .Values.domain.app }}"] — same domain for CORS.
+    - realm name: {{ .Values.keycloak.realm | quote }} — driven from values.
+
+helm_gcp/templates/configmaps/infra-configs-cm.yaml
+  PURPOSE : Provides configuration files for all observability components.
+  CONFIGMAPS :
+    prometheus-config  — prometheus.yml scraping all Spring Boot /actuator/prometheus
+                         endpoints plus OTel Collector metrics on port 8888.
+    otel-collector-config — OTel Collector pipeline: OTLP receivers (4317/4318),
+                         Prometheus exporter (8888), Loki exporter, Tempo exporter.
+    loki-config        — Loki single-process mode, filesystem storage at /loki.
+    tempo-config       — Tempo with OTLP receiver and local storage at /var/tempo.
+    grafana-datasources — Grafana provisioning YAML wiring Prometheus, Loki, Tempo.
+    nginx-config       — nginx server block for the Angular SPA: serves /index.html
+                         for all routes (SPA fallback), proxies /api/ to api-gateway.
+
+helm_gcp/templates/storage/pvcs.yaml
+  PURPOSE : Creates 8 PersistentVolumeClaims for stateful workloads.
+  PVCS :
+    postgres-keycloak-pvc  {{ .Values.storage.sizes.postgresKeycloak }}
+    postgres-user-pvc      {{ .Values.storage.sizes.postgresUser }}
+    postgres-product-pvc   {{ .Values.storage.sizes.postgresProduct }}
+    postgres-order-pvc     {{ .Values.storage.sizes.postgresOrder }}
+    prometheus-pvc         {{ .Values.storage.sizes.prometheus }}
+    loki-pvc               {{ .Values.storage.sizes.loki }}
+    tempo-pvc              {{ .Values.storage.sizes.tempo }}
+    grafana-pvc            {{ .Values.storage.sizes.grafana }}
+  STORAGE CLASS : {{ .Values.storage.class }} — defaults to standard-rwo (GKE pd-standard).
+
+helm_gcp/templates/databases/postgres-keycloak.yaml
+helm_gcp/templates/databases/postgres-user.yaml
+helm_gcp/templates/databases/postgres-product.yaml
+helm_gcp/templates/databases/postgres-order.yaml
+  PURPOSE : Deploys a dedicated PostgreSQL 16-alpine StatefulSet for each service.
+  WHAT THEY DO :
+    - StatefulSet (not Deployment) for stable pod identity and ordered rollout.
+    - Headless Service (clusterIP: None) for stable DNS: postgres-keycloak.myapp.svc,
+      postgres-user.myapp.svc, etc.
+    - Environment variables: POSTGRES_DB, POSTGRES_USER from .Values.databases.*,
+      POSTGRES_PASSWORD from secretKeyRef.
+    - PVC mounted at /var/lib/postgresql/data.
+    - Resources from {{- toYaml .Values.resources.postgres | nindent 12 }}.
+    - readinessProbe: pg_isready -U <user>.
+
+helm_gcp/templates/auth/keycloak.yaml
+  PURPOSE : Deploys Keycloak 24.0.4 in production mode on GKE.
+  GCP-SPECIFIC ENV VARS :
+    KC_HOSTNAME         — set to {{ .Values.domain.keycloak }} (external FQDN).
+                          Causes Keycloak to embed https://KEYCLOAK_DOMAIN in JWT iss claim.
+    KC_PROXY            — edge: tells Keycloak it's behind an SSL-terminating proxy (GCP LB).
+    KC_HOSTNAME_STRICT  — false: allows health check requests from any hostname.
+    KC_HTTP_ENABLED     — true: Keycloak listens on HTTP internally (GCP LB does TLS).
+  SERVICE TYPE : NodePort with annotation
+    cloud.google.com/backend-config: '{"default": "keycloak-backend-config"}'
+    Required for GKE Ingress LB to use the custom health check path /health/ready.
+  INIT CONTAINER : Imports the realm from keycloak-realm-cm ConfigMap at startup.
+  RESOURCES : {{- toYaml .Values.resources.keycloak | nindent 12 }}
+
+helm_gcp/templates/spring-cloud/config-server.yaml
+  PURPOSE : Deploys the Spring Cloud Config Server.
+  WHAT IT DOES :
+    - Image: {{ include "myapp.image" (dict "service" "config-server" "root" .) }}
+      resolves to Artifact Registry path.
+    - Mounts config-repo ConfigMap at /config-repo.
+    - CONFIG_SERVER_PASSWORD from config-server-secret.
+    - Service type: ClusterIP (not exposed externally).
+    - readinessProbe: GET /actuator/health on port 8888.
+
+helm_gcp/templates/spring-cloud/api-gateway.yaml
+  PURPOSE : Deploys Spring Cloud Gateway — the single external entry point.
+  WHAT IT DOES :
+    - KEYCLOAK_ISSUER_URI: {{ include "myapp.keycloakIssuerUri" . }}
+      External HTTPS URI required for JWT validation against Keycloak's JWKS.
+    - SPRING_CLOUD_CONFIG_URI: {{ include "myapp.configServerUri" . }}
+      Uses Kubernetes env var substitution ($(CONFIG_SERVER_PASSWORD)) for credentials.
+    - OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317 for distributed tracing.
+    - initContainers wait for config-server and keycloak readiness.
+    - Service type: NodePort with cloud.google.com/backend-config annotation
+      (api-gateway-backend-config uses /actuator/health:8090 as health check path).
+
+helm_gcp/templates/microservices/user-service.yaml
+  PURPOSE : Deploys the User Service (port 8081).
+  WHAT IT DOES :
+    - KEYCLOAK_ISSUER_URI: external HTTPS URI ({{ include "myapp.keycloakIssuerUri" . }}).
+    - SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-user:5432/{{ .Values.databases.userDb.name }}
+    - initContainers wait for postgres-user and config-server.
+    - Service type: ClusterIP (internal only — accessed via api-gateway).
+
+helm_gcp/templates/microservices/product-service.yaml
+  PURPOSE : Deploys the Product Service (port 8082).
+  WHAT IT DOES :
+    - Same pattern as user-service.
+    - SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-product:5432/{{ .Values.databases.productDb.name }}
+    - initContainers wait for postgres-product and config-server.
+    - Service type: ClusterIP.
+
+helm_gcp/templates/microservices/order-service.yaml
+  PURPOSE : Deploys the Order Service (port 8083).
+  TWO KEYCLOAK URLS (critical distinction):
+    KEYCLOAK_ISSUER_URI  — {{ include "myapp.keycloakIssuerUri" . }}
+                           External HTTPS URL. Spring Boot uses this to fetch
+                           Keycloak's JWKS and validate JWT iss claim.
+    KEYCLOAK_TOKEN_URI   — {{ include "myapp.keycloakTokenUri" . }}
+                           Internal http://keycloak:8080/... URL. order-service
+                           uses this for OAuth2 client_credentials token fetch to
+                           avoid public LB round-trip for machine-to-machine auth.
+  OTHER ENV VARS :
+    USER_SERVICE_URL, PRODUCT_SERVICE_URL — internal ClusterIP service addresses.
+    ORDER_SERVICE_CLIENT_SECRET — from order-client-secret.
+  SERVICE TYPE : ClusterIP.
+
+helm_gcp/templates/observability/otel-collector.yaml
+  PURPOSE : Deploys the OpenTelemetry Collector.
+  WHAT IT DOES :
+    - Image: otel/opentelemetry-collector-contrib:latest
+    - Receives traces/metrics via OTLP gRPC (4317) and OTLP HTTP (4318).
+    - Exposes Prometheus scrape endpoint on port 8888 for its own metrics.
+    - Mounts otel-collector-config ConfigMap at /etc/otel.
+    - readinessProbe: GET / on port 13133 (OTel Collector's health check extension).
+    - Resources: {{- toYaml .Values.resources.otelCollector | nindent 12 }}
+    - Service type: ClusterIP.
+
+helm_gcp/templates/observability/prometheus.yaml
+  PURPOSE : Deploys Prometheus time-series metrics database.
+  WHAT IT DOES :
+    - Image: prom/prometheus:latest
+    - Args: --config.file, --storage.tsdb.path=/prometheus,
+            --web.enable-lifecycle (hot-reload), --web.enable-remote-write-receiver.
+    - securityContext: runAsUser=65534 (nobody UID), runAsNonRoot=true.
+    - Mounts prometheus-config ConfigMap at /etc/prometheus.
+    - Mounts prometheus-pvc at /prometheus for time-series data persistence.
+    - readinessProbe: GET /-/ready on port 9090.
+    - livenessProbe: GET /-/healthy on port 9090.
+    - Resources: {{- toYaml .Values.resources.prometheus | nindent 12 }}
+    - Service type: ClusterIP.
+
+helm_gcp/templates/observability/loki.yaml
+  PURPOSE : Deploys Grafana Loki log aggregation.
+  WHAT IT DOES :
+    - Image: grafana/loki:3.0.0 (pinned version matching CLAUDE.md).
+    - securityContext: runAsUser=10001, runAsNonRoot=true.
+    - Mounts loki-config ConfigMap at /etc/loki.
+    - Mounts loki-pvc at /loki for log chunk persistence.
+    - readinessProbe and livenessProbe: GET /ready on port 3100.
+    - Resources: {{- toYaml .Values.resources.loki | nindent 12 }}
+    - Service type: ClusterIP.
+
+helm_gcp/templates/observability/tempo.yaml
+  PURPOSE : Deploys Grafana Tempo distributed trace storage.
+  WHAT IT DOES :
+    - Image: grafana/tempo:latest
+    - securityContext: runAsUser=10001, runAsNonRoot=true.
+    - Args: -config.file=/etc/tempo.yaml (loaded via subPath ConfigMap mount).
+    - Ports: 3100 (HTTP query), 4317 (OTLP gRPC), 4318 (OTLP HTTP).
+    - Mounts tempo-config ConfigMap key tempo.yaml at /etc/tempo.yaml via subPath.
+    - Mounts tempo-pvc at /var/tempo for trace storage.
+    - Resources: {{- toYaml .Values.resources.tempo | nindent 12 }}
+    - Service type: ClusterIP with named ports (http, otlp-grpc, otlp-http).
+
+helm_gcp/templates/observability/grafana.yaml
+  PURPOSE : Deploys Grafana 11.0.0 dashboard and visualization.
+  GCP-SPECIFIC ENV VAR :
+    GF_SERVER_ROOT_URL — https://{{ .Values.domain.grafana }}
+    Tells Grafana its externally visible URL for share links, OAuth redirects,
+    and email alerts; must match the domain behind the GCP LB.
+  OTHER ENV VARS :
+    GF_SECURITY_ADMIN_USER: admin
+    GF_SECURITY_ADMIN_PASSWORD: from grafana-secret
+    GF_USERS_ALLOW_SIGN_UP: "false"
+    GF_FEATURE_TOGGLES_ENABLE: traceqlEditor (enables TraceQL for Tempo)
+  securityContext : runAsUser=472, runAsNonRoot=true (Grafana's dedicated UID).
+  MOUNTS : grafana-datasources ConfigMap at /etc/grafana/provisioning/datasources,
+           grafana-pvc at /var/lib/grafana.
+  SERVICE TYPE : NodePort with cloud.google.com/backend-config annotation
+    (grafana-backend-config uses /api/health:3000 as health check path).
+
+helm_gcp/templates/frontend/frontend.yaml
+  PURPOSE : Deploys the Angular 17 SPA served by nginx.
+  GCP NOTE (embedded as YAML comment):
+    The Angular image must be built with the production config that bakes in
+    environment.prod.ts. Update keycloakUrl: 'https://{{ .Values.domain.keycloak }}'
+    in frontend/src/environments/environment.prod.ts before building.
+  WHAT IT DOES :
+    - Image: {{ include "myapp.image" (dict "service" "frontend" "root" .) }}
+    - Mounts nginx-config ConfigMap at /etc/nginx/conf.d.
+    - readinessProbe / livenessProbe: GET /index.html on port 80.
+    - Replicas: {{ .Values.replicas.frontend }} (default 2 for HA).
+    - Resources: {{- toYaml .Values.resources.frontend | nindent 12 }}
+  SERVICE TYPE : NodePort with cloud.google.com/backend-config annotation
+    (frontend-backend-config uses /index.html:80 as health check path).
+
+helm_gcp/templates/ingress/backend-configs.yaml
+  PURPOSE : Defines GCP-specific health check behavior per backend service.
+  WHY NEEDED : The Google Cloud HTTP(S) LB uses GET / on the node port by default,
+    which returns 4xx for Spring Boot (no route at /) and 302 for Keycloak (login redirect).
+    BackendConfig CRDs override this per backend.
+  FOUR BackendConfigs :
+    frontend-backend-config   — requestPath: /index.html, port: 80, timeout: 30s
+    api-gateway-backend-config— requestPath: /actuator/health, port: 8090, timeout: 60s
+    keycloak-backend-config   — requestPath: /health/ready, port: 8080, timeout: 60s,
+                                unhealthyThreshold: 5 (Keycloak is slow to start)
+    grafana-backend-config    — requestPath: /api/health, port: 3000, timeout: 30s
+  All include connectionDraining.drainingTimeoutSec: 60 for graceful pod shutdown.
+
+helm_gcp/templates/ingress/frontend-config.yaml
+  PURPOSE : Enforces HTTP→HTTPS redirect at the Google Cloud LB level.
+  WHAT IT DOES :
+    - apiVersion: networking.gke.io/v1beta1, kind: FrontendConfig.
+    - spec.redirectToHttps.enabled: true, responseCodeName: MOVED_PERMANENTLY_DEFAULT (301).
+    - Applied to the Ingress via annotation:
+      networking.gke.io/v1beta1.FrontendConfig: "myapp-frontend-config"
+    - This redirect happens at the LB (before the request reaches any pod),
+      ensuring all HTTP traffic is upgraded without any application code changes.
+
+helm_gcp/templates/ingress/managed-certs.yaml
+  PURPOSE : Provisions Google-managed TLS certificates for all three public domains.
+  WHAT IT DOES :
+    - apiVersion: networking.gke.io/v1, kind: ManagedCertificate.
+    - Domains: {{ .Values.domain.app }}, {{ .Values.domain.keycloak }}, {{ .Values.domain.grafana }}.
+    - Google's Certificate Manager automatically provisions and renews certs once
+      DNS A records for all listed domains point to the reserved static IP.
+    - Certificate status: Provisioning → Active (up to 60 minutes after DNS resolves).
+    - Referenced in Ingress via:
+      networking.gke.io/managed-certificates: "myapp-cert"
+
+helm_gcp/templates/ingress/ingress.yaml
+  PURPOSE : Creates the GKE native Ingress which provisions a Google Cloud HTTP(S) LB.
+  ANNOTATIONS :
+    kubernetes.io/ingress.class: "gce"
+      Forces use of the GKE native Ingress controller (Google Cloud LB).
+    kubernetes.io/ingress.global-static-ip-name: {{ .Values.gcp.staticIpName }}
+      Binds the LB to the pre-reserved global static IP.
+    networking.gke.io/managed-certificates: "myapp-cert"
+      Attaches the ManagedCertificate for automatic TLS.
+    networking.gke.io/v1beta1.FrontendConfig: "myapp-frontend-config"
+      Applies HTTP→HTTPS redirect from FrontendConfig.
+  PATH ROUTING :
+    {{ .Values.domain.app }}/api   → api-gateway:8090   (Prefix match — all /api/* requests)
+    {{ .Values.domain.app }}/      → frontend:80         (Prefix match — SPA, nginx handles routing)
+    {{ .Values.domain.keycloak }}/ → keycloak:8080       (All Keycloak paths: /auth, /realms, etc.)
+    {{ .Values.domain.grafana }}/  → grafana:3000        (All Grafana paths)
+  IMPORTANT : No rewrite-target annotation. Adding rewrite-target: / would strip
+    the path from proxied requests, breaking all API and Keycloak endpoints.
+
+helm_gcp/templates/scaling/hpa.yaml
+  PURPOSE : Horizontal autoscaling for all stateless services.
+  CONDITIONAL : Wrapped in {{- if .Values.autoscaling.enabled }} so HPAs can be
+    disabled by setting autoscaling.enabled: false in values.
+  FIVE HPAs (autoscaling/v2):
+    api-gateway-hpa    — minReplicas/maxReplicas from .Values.autoscaling.microservices
+    user-service-hpa   — same
+    product-service-hpa— same
+    order-service-hpa  — same
+    frontend-hpa       — minReplicas/maxReplicas from .Values.autoscaling.frontend
+  METRICS : CPU utilization (target: cpuUtilization%) + Memory utilization
+    (target: memoryUtilization%) for microservices. CPU only for frontend.
+  PREREQUISITE : GKE Metrics Server must be running (enabled by default).
+    Verify: kubectl top pods -n myapp
+
+helm_gcp/templates/scaling/pdb.yaml
+  PURPOSE : Protects service availability during voluntary disruptions
+    (node upgrades, cluster maintenance, pod evictions).
+  CONDITIONAL : Wrapped in {{- if .Values.podDisruptionBudget.enabled }}.
+  SEVEN PDBs (policy/v1):
+    api-gateway-pdb, user-service-pdb, product-service-pdb, order-service-pdb,
+    keycloak-pdb, frontend-pdb, config-server-pdb.
+  BEHAVIOR : minAvailable: {{ .Values.podDisruptionBudget.minAvailable }} (default 1).
+    Kubernetes will not evict a pod if doing so would bring the number of available
+    pods below this threshold.
+  SELECTOR : Uses myapp.selectorLabels helper to match the same app: <component> label
+    as each Deployment's pod template.
+
+helm_gcp/scripts/install.sh
+  PURPOSE : First-time Helm install onto GKE.
+  WHAT IT DOES :
+    1. Fetches GKE cluster credentials (gcloud container clusters get-credentials).
+    2. Verifies kubectl context is correct.
+    3. Validates that values.secrets.yaml exists (exits with clear error if not).
+    4. Runs helm lint to catch template errors before applying.
+    5. Runs helm install with:
+       --namespace myapp --create-namespace (creates namespace if absent)
+       --values values.secrets.yaml
+       --timeout 15m --wait --atomic
+       (atomic: auto-rollback if any resource fails to become ready within timeout)
+    6. Prints static IP and DNS setup instructions after install.
+  CONFIGURATION : Edit PROJECT_ID, REGION, CLUSTER_NAME at the top of the script.
+
+helm_gcp/scripts/upgrade.sh
+  PURPOSE : Upgrades an existing Helm release after image pushes or value changes.
+  WHAT IT DOES :
+    1. Fetches cluster credentials.
+    2. Validates secrets file.
+    3. Runs helm lint.
+    4. Runs helm upgrade with --atomic --cleanup-on-fail (removes newly created
+       resources if the upgrade fails, enabling clean rollback).
+    5. Prints helm history (last 5 releases) and pod status.
+    6. Shows rollback command for quick reference.
+  PARTIAL UPGRADE EXAMPLE (no script needed):
+    helm upgrade myapp . --reuse-values --set image.tag=1.1.0
+
+helm_gcp/scripts/uninstall.sh
+  PURPOSE : Removes the Helm release from GKE.
+  MODES :
+    bash scripts/uninstall.sh            — removes all Helm-managed resources;
+                                           preserves all PVCs (data is safe).
+    bash scripts/uninstall.sh --purge-pvcs — also deletes all PVCs after
+                                           interactive confirmation; IRREVERSIBLE.
+  NOTE : The script does NOT delete the GKE cluster, static IP, or Artifact
+    Registry. These are long-lived GCP resources; commands to remove them are
+    printed at the end for reference.
+
+=====================================================================
+GCP HELM DEPLOYMENT GUIDE — STEP BY STEP
+=====================================================================
+
+PHASE 0 — Prerequisites
+------------------------
+Install on your local machine:
+  - Google Cloud SDK:  gcloud --version  (>= 400.0.0)
+  - kubectl:           kubectl version --client
+  - Helm 3:            helm version --short  (>= 3.12.0)
+  - Docker:            docker --version
+
+Authenticate with GCP:
+  gcloud auth login
+  gcloud auth application-default login
+
+PHASE 1 — Edit Configuration Files
+------------------------------------
+1a. Update helm_gcp/values.yaml with your real values:
+    gcp:
+      region: us-central1          # your preferred GCP region
+      projectId: my-gcp-project    # your GCP project ID
+    domain:
+      app:      app.example.com
+      keycloak: keycloak.example.com
+      grafana:  grafana.example.com
+
+1b. Update the Angular production environment:
+    Edit frontend/src/environments/environment.prod.ts:
+      keycloakUrl: 'https://keycloak.example.com'    # your Keycloak domain
+    This value is baked into the Angular bundle at build time.
+    It cannot be changed without rebuilding the image.
+
+1c. Create secrets override file:
+    cp helm_gcp/values.secrets.yaml.example helm_gcp/values.secrets.yaml
+    Edit values.secrets.yaml — replace all placeholder base64 values:
+      echo -n "your-secure-password" | base64
+    Add to .gitignore:
+      echo "helm_gcp/values.secrets.yaml" >> .gitignore
+
+PHASE 2 — Provision GCP Infrastructure (run once)
+---------------------------------------------------
+Edit PROJECT_ID, REGION, etc. at the top of the script, then:
+
+  bash k8s_gcp/scripts/00-setup-gcp.sh
+
+This script:
+  - Enables required GCP APIs (container, artifactregistry, compute, etc.)
+  - Creates an Artifact Registry repository named "myapp"
+  - Creates a GKE Standard cluster with cluster autoscaling (2–6 nodes)
+  - Reserves a global static IP named "myapp-static-ip"
+  - Fetches cluster credentials into kubeconfig
+  - Prints the static IP address
+
+Note: The same k8s_gcp/scripts/00-setup-gcp.sh script works for both the
+raw kubectl (k8s_gcp/) and Helm (helm_gcp/) deployment paths since they
+share the same GCP infrastructure.
+
+PHASE 3 — Build and Push Docker Images
+----------------------------------------
+Edit PROJECT_ID, REGION at the top of the script, then:
+
+  bash k8s_gcp/scripts/01-build-push.sh
+
+This script builds 6 images (--platform linux/amd64) and pushes to AR:
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/config-server:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/api-gateway:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/product-service:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/order-service:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/frontend:1.0.0
+
+Note: The build-push script is also shared with the k8s_gcp deployment path.
+
+PHASE 4 — Configure DNS
+------------------------
+Get the reserved static IP:
+  gcloud compute addresses describe myapp-static-ip --global \
+    --format="get(address)"
+
+In your DNS provider, create A records:
+  app.example.com       →  <STATIC_IP>
+  keycloak.example.com  →  <STATIC_IP>
+  grafana.example.com   →  <STATIC_IP>
+
+DNS propagation can take 5–60 minutes. The ManagedCertificate will not
+provision until all three domains resolve to the static IP.
+
+PHASE 5 — Install the Helm Chart
+----------------------------------
+Edit PROJECT_ID, REGION, CLUSTER_NAME at the top of install.sh, then:
+
+  cd helm_gcp
+  bash scripts/install.sh
+
+What install.sh does:
+  - Fetches cluster credentials
+  - Validates values.secrets.yaml exists
+  - Runs helm lint (fails fast on template errors)
+  - Runs helm install --namespace myapp --create-namespace --atomic --wait
+    (Helm waits up to 15m for all pods to become ready; rolls back on failure)
+  - Prints DNS instructions and cert status command
+
+Alternatively, install manually:
+  gcloud container clusters get-credentials myapp-cluster \
+    --region us-central1 --project PROJECT_ID
+
+  helm lint helm_gcp/ --values helm_gcp/values.secrets.yaml
+
+  helm install myapp helm_gcp/ \
+    --namespace myapp \
+    --create-namespace \
+    --values helm_gcp/values.secrets.yaml \
+    --timeout 15m \
+    --wait \
+    --atomic
+
+Monitor startup:
+  kubectl get pods -n myapp -w
+  kubectl get events -n myapp --sort-by='.lastTimestamp'
+
+PHASE 6 — Wait for ManagedCertificate
+---------------------------------------
+  kubectl describe managedcertificate myapp-cert -n myapp
+
+Status field: Provisioning → Active (up to 60 minutes after DNS resolves).
+The site will show a certificate error until status is Active.
+The GKE Ingress object shows events about LB provisioning:
+  kubectl describe ingress myapp-ingress -n myapp
+
+PHASE 7 — Import Keycloak Realm and Create Test Users
+------------------------------------------------------
+The Keycloak realm is auto-imported from the ConfigMap on first startup.
+Verify import:
+  kubectl logs -n myapp -l app=keycloak | grep "Import of realm"
+
+Access Keycloak Admin Console:
+  https://keycloak.example.com/admin
+  Username: admin    Password: (from values.secrets.yaml keycloakAdminPassword)
+
+Verify:
+  - Realm "myapp-realm" exists
+  - Client "angular-client" exists (public, PKCE enabled)
+  - Client "order-service-client" exists (confidential, serviceAccountsEnabled)
+  - Protocol mappers on both clients include the "roles" claim mapper
+
+Create test users (if not in realm export):
+  1. Go to myapp-realm → Users → Add User
+  2. Username: user1   Email: user1@example.com
+  3. Credentials tab → Set Password: User@1234!  (temporary: off)
+  4. Role Mappings tab → Realm Roles → assign ROLE_USER
+  5. Repeat for admin1 with both ROLE_USER and ROLE_ADMIN
+
+PHASE 8 — Access the Application
+----------------------------------
+  Angular App:  https://app.example.com
+  API Gateway:  https://app.example.com/api
+  Keycloak:     https://keycloak.example.com/admin
+  Grafana:      https://grafana.example.com  (admin / grafana_pass)
+  Prometheus:   Internal only — kubectl port-forward svc/prometheus 9090:9090 -n myapp
+
+PHASE 9 — Upgrading
+---------------------
+After pushing a new image tag or changing values:
+
+  # Build and push new images (example: tag 1.1.0)
+  # Edit IMAGE_TAG in 01-build-push.sh → 1.1.0, then:
+  bash k8s_gcp/scripts/01-build-push.sh
+
+  # Upgrade with new image tag
+  cd helm_gcp
+  bash scripts/upgrade.sh
+  # Or: helm upgrade myapp . --reuse-values --set image.tag=1.1.0
+
+  # View release history
+  helm history myapp --namespace myapp
+
+  # Roll back to previous release if needed
+  helm rollback myapp --namespace myapp
+
+PHASE 10 — Monitoring and Debugging
+-------------------------------------
+  # Check all pod status
+  kubectl get pods -n myapp
+
+  # Follow logs for a specific pod
+  kubectl logs -n myapp -l app=order-service -f
+
+  # Describe a failing pod (shows events, resource limits, etc.)
+  kubectl describe pod <pod-name> -n myapp
+
+  # Check HPA status (scale-out activity)
+  kubectl get hpa -n myapp
+
+  # Check PDB status (disruption budget)
+  kubectl get pdb -n myapp
+
+  # Port-forward Prometheus for direct query access
+  kubectl port-forward svc/prometheus 9090:9090 -n myapp
+
+  # Port-forward Grafana if Ingress cert is pending
+  kubectl port-forward svc/grafana 3000:3000 -n myapp
+
+PHASE 11 — Uninstall
+---------------------
+  # Remove all Helm-managed resources; keep PVCs (database data preserved)
+  cd helm_gcp
+  bash scripts/uninstall.sh
+
+  # Remove all resources including PVCs (IRREVERSIBLE — all data lost)
+  bash scripts/uninstall.sh --purge-pvcs
+
+  # Delete GCP infrastructure (cluster, static IP, Artifact Registry)
+  gcloud container clusters delete myapp-cluster --region=REGION
+  gcloud compute addresses delete myapp-static-ip --global
+  gcloud artifacts repositories delete myapp --location=REGION
+
+HELM TIPS
+---------
+  # Dry-run: preview all generated manifests without applying
+  helm install myapp helm_gcp/ --dry-run --debug \
+    --values helm_gcp/values.secrets.yaml
+
+  # Template: render templates locally without a cluster
+  helm template myapp helm_gcp/ \
+    --values helm_gcp/values.secrets.yaml \
+    --namespace myapp
+
+  # Lint: validate templates and values schema
+  helm lint helm_gcp/ --values helm_gcp/values.secrets.yaml
+
+  # Diff (requires helm-diff plugin):
+  helm plugin install https://github.com/databus23/helm-diff
+  helm diff upgrade myapp helm_gcp/ --values helm_gcp/values.secrets.yaml
+
+  # Package chart for distribution
+  helm package helm_gcp/
+
+  # Override a single value without editing files
+  helm upgrade myapp helm_gcp/ --reuse-values \
+    --set replicas.orderService=3
+
+  # Override storage class for SSD (higher IOPS)
+  helm upgrade myapp helm_gcp/ --reuse-values \
+    --set storage.class=premium-rwo
+
+KNOWN GCP-SPECIFIC GOTCHAS
+---------------------------
+1. JWT Issuer Mismatch
+   KC_PROXY=edge + KC_HOSTNAME=keycloak.example.com causes Keycloak to put
+   https://keycloak.example.com/realms/myapp-realm in the JWT iss claim.
+   KEYCLOAK_ISSUER_URI in ALL Spring Boot services must match this exactly.
+   The myapp.keycloakIssuerUri helper always returns the correct HTTPS URI.
+
+2. BackendConfig Required for Health Checks
+   Without BackendConfig CRDs, the GCP LB probes GET / on the node port.
+   Spring Boot returns 404 at /, Keycloak returns 302 (login redirect).
+   Both cause the LB to mark the backend as unhealthy and drop traffic.
+
+3. No rewrite-target on the Ingress
+   Adding nginx.ingress.kubernetes.io/rewrite-target: / would strip the path
+   prefix from all proxied requests, breaking /api, /realms, and /grafana routes.
+   The GKE native Ingress does NOT use nginx annotations — do not add them.
+
+4. CONFIG_SERVER_PASSWORD Must Be Defined Before SPRING_CLOUD_CONFIG_URI
+   Kubernetes $(VAR) substitution only resolves variables defined earlier in
+   the env list. The configServerUri helper embeds $(CONFIG_SERVER_PASSWORD)
+   in the URI. In all Deployment templates the CONFIG_SERVER_PASSWORD env var
+   appears before SPRING_CLOUD_CONFIG_URI — do not reorder them.
+
+5. ManagedCertificate Provisioning Time
+   Certificates can take up to 60 minutes to provision after DNS resolves.
+   During this time HTTPS connections will show a certificate error.
+   Use kubectl port-forward to access services while waiting.
+
+6. Angular Keycloak URL Is Baked In at Build Time
+   environment.prod.ts is compiled into the Angular bundle during docker build.
+   If you change the Keycloak domain after building, you must rebuild the image.
+   Always update environment.prod.ts before running 01-build-push.sh.
+
+7. PVCs Are Not Deleted by helm uninstall
+   This is intentional to protect database data across chart upgrades.
+   Use --purge-pvcs flag with uninstall.sh only when doing a full teardown.
+
+8. GKE Ingress Requires NodePort Services
+   The Google Cloud LB communicates with pods via node ports, not ClusterIP.
+   Services exposed through the Ingress (frontend, api-gateway, keycloak,
+   grafana) are type: NodePort. Internal services remain type: ClusterIP.
+=====================================================================

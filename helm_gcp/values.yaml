@@ -1,0 +1,147 @@
+# =============================================================================
+# values.yaml — MyApp Helm Chart
+# All configurable knobs live here. Secret values should be supplied via a
+# separate values.secrets.yaml (see values.secrets.yaml.example) or via
+# --set flags. Never commit real secrets in this file.
+# =============================================================================
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ─── GCP SETTINGS ─────────────────────────────────────────────────────────────
+gcp:
+  region: REGION              # e.g. us-central1
+  projectId: PROJECT_ID       # e.g. my-gcp-project
+  artifactRegistry:
+    repository: myapp         # Artifact Registry repo name (created by 00-setup-gcp.sh)
+  staticIpName: myapp-static-ip   # Name of the reserved global static IP
+
+# ─── PUBLIC DOMAIN NAMES ──────────────────────────────────────────────────────
+domain:
+  app:      APP_DOMAIN        # Frontend public hostname, e.g. app.example.com
+  keycloak: KEYCLOAK_DOMAIN   # Keycloak public hostname, e.g. keycloak.example.com
+  grafana:  GRAFANA_DOMAIN    # Grafana public hostname,  e.g. grafana.example.com
+
+# ─── IMAGE ────────────────────────────────────────────────────────────────────
+image:
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+# ─── SECRETS (base64-encoded) ─────────────────────────────────────────────────
+# These are development defaults. REPLACE all values before deploying.
+# Recommended: copy values.secrets.yaml.example → values.secrets.yaml,
+# fill in real secrets, add values.secrets.yaml to .gitignore, and pass
+# it with: helm install myapp ./helm_gcp --values values.secrets.yaml
+#
+# Generate: echo -n "your-password" | base64
+secrets:
+  keycloakDbPassword:    a2V5Y2xvYWtfZGJfcGFzcw==   # keycloak_db_pass
+  keycloakAdmin:         YWRtaW4=                      # admin
+  keycloakAdminPassword: QWRtaW5AMTIzNCE=             # Admin@1234!
+  userDbPassword:        dXNlcl9kYl9wYXNz             # user_db_pass
+  productDbPassword:     cHJvZHVjdF9kYl9wYXNz         # product_db_pass
+  orderDbPassword:       b3JkZXJfZGJfcGFzcw==          # order_db_pass
+  orderClientSecret:     b3JkZXItc2VydmljZS1zZWNyZXQ= # order-service-secret
+  configServerPassword:  Y29uZmlnX3Bhc3M=              # config_pass
+  grafanaAdminPassword:  Z3JhZmFuYV9wYXNz              # grafana_pass
+
+# ─── STORAGE ──────────────────────────────────────────────────────────────────
+storage:
+  # standard-rwo = pd-standard (HDD) ReadWriteOnce on GKE
+  # premium-rwo  = pd-ssd (SSD)  ReadWriteOnce on GKE — higher IOPS, higher cost
+  class: standard-rwo
+  sizes:
+    postgresKeycloak: 5Gi
+    postgresUser:     5Gi
+    postgresProduct:  5Gi
+    postgresOrder:    5Gi
+    prometheus:       10Gi
+    loki:             10Gi
+    tempo:            10Gi
+    grafana:          2Gi
+
+# ─── REPLICAS ─────────────────────────────────────────────────────────────────
+# HPA will override these at runtime when autoscaling.enabled = true.
+replicas:
+  frontend:       2
+  keycloak:       1
+  configServer:   1
+  apiGateway:     1
+  userService:    1
+  productService: 1
+  orderService:   1
+  otelCollector:  1
+  prometheus:     1
+  loki:           1
+  tempo:          1
+  grafana:        1
+
+# ─── RESOURCES ────────────────────────────────────────────────────────────────
+resources:
+  keycloak:
+    requests: { cpu: 500m,  memory: 1Gi  }
+    limits:   { cpu: 2000m, memory: 2Gi  }
+  microservices:    # api-gateway, user-service, product-service, order-service
+    requests: { cpu: 200m,  memory: 512Mi }
+    limits:   { cpu: 800m,  memory: 1Gi   }
+  configServer:
+    requests: { cpu: 150m,  memory: 384Mi }
+    limits:   { cpu: 500m,  memory: 512Mi }
+  postgres:
+    requests: { cpu: 100m,  memory: 256Mi }
+    limits:   { cpu: 500m,  memory: 512Mi }
+  frontend:
+    requests: { cpu: 50m,   memory: 64Mi  }
+    limits:   { cpu: 200m,  memory: 128Mi }
+  otelCollector:
+    requests: { cpu: 100m,  memory: 128Mi }
+    limits:   { cpu: 300m,  memory: 256Mi }
+  prometheus:
+    requests: { cpu: 200m,  memory: 512Mi }
+    limits:   { cpu: 1000m, memory: 2Gi   }
+  loki:
+    requests: { cpu: 100m,  memory: 256Mi }
+    limits:   { cpu: 500m,  memory: 512Mi }
+  tempo:
+    requests: { cpu: 100m,  memory: 256Mi }
+    limits:   { cpu: 500m,  memory: 512Mi }
+  grafana:
+    requests: { cpu: 100m,  memory: 256Mi }
+    limits:   { cpu: 500m,  memory: 512Mi }
+
+# ─── AUTOSCALING ──────────────────────────────────────────────────────────────
+autoscaling:
+  enabled: true
+  microservices:          # applies to: api-gateway, user/product/order-service
+    minReplicas: 1
+    maxReplicas: 4
+    cpuUtilization: 70
+    memoryUtilization: 80
+  frontend:
+    minReplicas: 2
+    maxReplicas: 6
+    cpuUtilization: 70
+
+# ─── POD DISRUPTION BUDGET ────────────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ─── KEYCLOAK ─────────────────────────────────────────────────────────────────
+keycloak:
+  realm: myapp-realm
+  db:
+    name: keycloak
+    user: keycloak
+
+# ─── DATABASE NAMES ───────────────────────────────────────────────────────────
+databases:
+  userDb:
+    name: userdb
+    user: userservice
+  productDb:
+    name: productdb
+    user: productservice
+  orderDb:
+    name: orderdb
+    user: orderservice

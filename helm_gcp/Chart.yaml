@@ -1,0 +1,19 @@
+apiVersion: v2
+name: myapp
+description: >
+  Full-stack microservices application with Angular 17 frontend, Spring Boot 3
+  microservices, Keycloak 24 auth, Spring Cloud Gateway, Spring Cloud Config,
+  and a full Grafana + OTel observability stack. Targets GKE (Google Kubernetes
+  Engine) with native GCP Ingress, Google-managed TLS, and Artifact Registry.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - spring-boot
+  - angular
+  - keycloak
+  - microservices
+  - gke
+  - gcp
+maintainers:
+  - name: myapp-team

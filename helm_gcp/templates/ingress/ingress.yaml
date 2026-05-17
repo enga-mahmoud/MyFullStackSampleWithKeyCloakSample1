@@ -1,0 +1,67 @@
+# GKE native Ingress — creates a Google Cloud HTTP(S) Load Balancer.
+#
+# Prerequisites:
+#   1. Reserve static IP:  gcloud compute addresses create {{ .Values.gcp.staticIpName }} --global
+#   2. Create DNS A records for all three domains pointing to the static IP:
+#      gcloud compute addresses describe {{ .Values.gcp.staticIpName }} --global --format="get(address)"
+#   3. Wait for ManagedCertificate to reach "Active" status before using HTTPS.
+#
+# Path routing:
+#   {{ .Values.domain.app }}/         → frontend:80
+#   {{ .Values.domain.app }}/api/*    → api-gateway:8090
+#   {{ .Values.domain.keycloak }}/    → keycloak:8080
+#   {{ .Values.domain.grafana }}/     → grafana:3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: {{ .Values.gcp.staticIpName | quote }}
+    networking.gke.io/managed-certificates: "myapp-cert"
+    networking.gke.io/v1beta1.FrontendConfig: "myapp-frontend-config"
+spec:
+  rules:
+    - host: {{ .Values.domain.app }}
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8090
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+
+    - host: {{ .Values.domain.keycloak }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+
+    - host: {{ .Values.domain.grafana }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000

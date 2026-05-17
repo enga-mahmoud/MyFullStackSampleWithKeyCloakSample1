@@ -1,0 +1,101 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# PodDisruptionBudgets ensure at least one pod of each critical service remains
+# available during node upgrades, cluster maintenance, or voluntary evictions.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "api-gateway" "root" .) | nindent 6 }}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: user-service-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "user-service" "root" .) | nindent 6 }}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: product-service-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "product-service" "root" .) | nindent 6 }}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "order-service" "root" .) | nindent 6 }}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keycloak-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "keycloak" "root" .) | nindent 6 }}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "frontend" "root" .) | nindent 6 }}
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: config-server-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "config-server" "root" .) | nindent 6 }}
+{{- end }}

@@ -1,0 +1,71 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas.loki }}
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "loki" "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "myapp.selectorLabels" (dict "component" "loki" "root" .) | nindent 8 }}
+    spec:
+      securityContext:
+        fsGroup: 10001
+        runAsUser: 10001
+        runAsNonRoot: true
+      containers:
+        - name: loki
+          image: grafana/loki:3.0.0
+          args: ["-config.file=/etc/loki/loki-config.yaml"]
+          ports:
+            - containerPort: 3100
+          volumeMounts:
+            - name: loki-config
+              mountPath: /etc/loki
+            - name: loki-data
+              mountPath: /loki
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3100
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 3100
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources.loki | nindent 12 }}
+      volumes:
+        - name: loki-config
+          configMap:
+            name: loki-config
+        - name: loki-data
+          persistentVolumeClaim:
+            claimName: loki-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "myapp.selectorLabels" (dict "component" "loki" "root" .) | nindent 4 }}
+  ports:
+    - port: 3100
+      targetPort: 3100

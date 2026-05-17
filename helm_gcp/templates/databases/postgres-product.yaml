@@ -1,0 +1,71 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-product
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  serviceName: postgres-product
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "myapp.selectorLabels" (dict "component" "postgres-product" "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "myapp.selectorLabels" (dict "component" "postgres-product" "root" .) | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.databases.productDb.name }}
+            - name: POSTGRES_USER
+              value: {{ .Values.databases.productDb.user }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: product-db-secret
+                  key: PRODUCT_DB_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.databases.productDb.user | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.databases.productDb.user | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources.postgres | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-product-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-product
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "myapp.selectorLabels" (dict "component" "postgres-product" "root" .) | nindent 4 }}
+  ports:
+    - port: 5432
+      targetPort: 5432

@@ -1,0 +1,14 @@
+# Google-managed SSL certificates — provisioned automatically once DNS A records
+# for all three domains point to the reserved static IP (myapp-static-ip).
+# Certificate status transitions: Provisioning → Active (can take up to 60 minutes).
+# Check status: kubectl describe managedcertificate myapp-cert -n myapp
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: myapp-cert
+  namespace: myapp
+spec:
+  domains:
+    - APP_DOMAIN
+    - KEYCLOAK_DOMAIN
+    - GRAFANA_DOMAIN
