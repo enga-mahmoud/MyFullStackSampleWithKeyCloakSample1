@@ -26,7 +26,9 @@
       "Bash(Get-ChildItem -Recurse -Path \"D:\\\\MyProjects\\\\MyFullStackSampleWithKeyCloackSample1\\\\frontend\\\\src\\\\app\\\\pages\" -Filter \"*.html\")",
       "Bash(docker exec *)",
       "Bash(grep -v \"^$\")",
-      "Bash(docker compose *)"
+      "Bash(docker compose *)",
+      "Bash(git pull *)",
+      "Bash(git stash *)"
     ]
   }
 }
