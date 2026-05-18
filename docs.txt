@@ -3898,4 +3898,609 @@ KNOWN GCP-SPECIFIC GOTCHAS
    The Google Cloud LB communicates with pods via node ports, not ClusterIP.
    Services exposed through the Ingress (frontend, api-gateway, keycloak,
    grafana) are type: NodePort. Internal services remain type: ClusterIP.
+
+=====================================================================
+  KEYCLOAK REALM EXPORT — FULL REFERENCE
+  File: infrastructure/keycloak/realm-export.json
+=====================================================================
+
+  This section provides a complete, field-by-field reference for the
+  Keycloak realm export file. This JSON file is the single source of
+  truth for the entire Keycloak security configuration. Keycloak reads
+  it at first startup via the --import-realm flag and sets up the realm,
+  roles, clients, users, and token mappings automatically — no manual
+  Keycloak Admin Console steps are required.
+
+  The export is also the canonical record of what tokens look like and
+  why: every JWT claim, every grant type decision, and every session
+  timeout can be traced back to a field in this file.
+
+---------------------------------------------------------------------
+  1. REALM-LEVEL SETTINGS
+---------------------------------------------------------------------
+
+  realm                  : "myapp-realm"
+    The internal name of the realm. All Keycloak endpoints are prefixed
+    with this name (e.g. /realms/myapp-realm/protocol/openid-connect/token).
+    Must match the KEYCLOAK_ISSUER_URI configured in every Spring Boot
+    service and the realm value in the Angular Keycloak initializer.
+
+  displayName            : "MyApp Realm"
+    Human-readable label shown on the Keycloak login screen header.
+
+  enabled                : true
+    The realm is active. Setting this to false would block all logins
+    without deleting any data.
+
+  sslRequired            : "none"
+    Disables Keycloak's built-in SSL enforcement. Suitable for local
+    development and Docker Compose where all traffic is on localhost.
+    PRODUCTION WARNING: change to "external" (enforce HTTPS for external
+    requests) or "all" (enforce HTTPS for all requests including internal)
+    before deploying to any internet-facing environment.
+
+  registrationAllowed    : false
+    Self-registration via the login page is disabled. New accounts can
+    only be created by an administrator via the Admin Console, Admin REST
+    API, or by adding users to this export file.
+
+  loginWithEmailAllowed  : true
+    Users can authenticate using their email address in addition to their
+    username. Both "user1" and "user1@myapp.com" would work as the login
+    identifier.
+
+  duplicateEmailsAllowed : false
+    Enforces email uniqueness across the realm. Attempting to create two
+    accounts with the same email is rejected.
+
+  resetPasswordAllowed   : true
+    Enables the "Forgot password?" link on the login screen. Keycloak
+    sends a password-reset email when a user requests it. Requires a
+    working email server to be configured in the realm SMTP settings
+    (not defined in this export — must be set in the Admin Console for
+    the reset flow to deliver mail).
+
+  editUsernameAllowed    : false
+    Once created, a user's username is immutable from the self-service
+    profile page. An administrator can still change it via the Admin API.
+
+  bruteForceProtected    : true
+    Activates Keycloak's built-in brute-force detection. After a
+    configurable number of failed login attempts the account is
+    temporarily locked. Default thresholds (30 failures, 1-minute wait,
+    permanent lock after 12 hours) apply unless overridden in the realm
+    brute-force settings. This field alone enables the feature; the
+    detailed thresholds are not stored in this export and use Keycloak
+    defaults.
+
+  accessTokenLifespan    : 300  (5 minutes)
+    How long (seconds) an access token is valid after it is issued.
+    Spring Boot services validate the exp claim on every request; a
+    token older than 5 minutes will be rejected. The Angular Keycloak
+    library silently refreshes the token before expiry using the refresh
+    token, so normal UI users are unaffected.
+
+  ssoSessionIdleTimeout  : 1800  (30 minutes)
+    A browser SSO session is destroyed if the user is idle (no token
+    refresh or interaction) for 30 minutes. After this the user must
+    log in again.
+
+  ssoSessionMaxLifespan  : 36000  (10 hours)
+    Hard ceiling on a browser SSO session regardless of activity. Even
+    an active user is forced to re-authenticate after 10 hours. This
+    bounds the window of exposure if a session token is stolen.
+
+---------------------------------------------------------------------
+  2. REALM ROLES
+---------------------------------------------------------------------
+
+  Realm roles are global to the realm and can be assigned to any user
+  or service account. This project uses two roles only.
+
+  ROLE_USER
+    description : "Standard user role"
+    composite   : false  — not built from other roles; a simple grant
+    clientRole  : false  — this is a realm role, not scoped to a client
+
+    Assigned to: user1, admin1, service-account-order-service-client
+    Grants access to: all read endpoints across user-service,
+    product-service, and order-service. Spring Security checks for the
+    ROLE_USER authority on protected GET routes.
+
+  ROLE_ADMIN
+    description : "Administrator role"
+    composite   : false
+    clientRole  : false
+
+    Assigned to: admin1, service-account-order-service-client
+    Grants access to: write endpoints (POST/PUT/DELETE) across all
+    microservices and the /admin route in the Angular frontend. Spring
+    Security checks for ROLE_ADMIN on @PreAuthorize("hasRole('ADMIN')")
+    annotated methods. The leading "ROLE_" prefix is added by the JWT
+    authorities converter in SecurityConfig.java if it is absent.
+
+  HOW ROLES REACH THE JWT:
+    The protocol mapper in each client (and the "roles" client scope)
+    reads the user's realm roles and writes them into the JWT under the
+    "roles" claim as a JSON string array. Spring Boot extracts this
+    claim with jwt.getClaimAsStringList("roles").
+
+---------------------------------------------------------------------
+  3. CLIENTS
+---------------------------------------------------------------------
+
+  Keycloak clients represent applications or services that interact with
+  the authorization server. Each has its own grant type profile, secret
+  policy, and token configuration.
+
+  ·····································
+  3.1  angular-client
+  ·····································
+
+  clientId               : "angular-client"
+  name                   : "Angular Frontend Client"
+  description            : "Public SPA client for Angular frontend"
+  enabled                : true
+  publicClient           : true
+    No client secret is used. Browser-based SPAs cannot keep a secret
+    confidential, so the public client type is the correct choice for
+    Angular. Security is provided by PKCE instead of a secret.
+
+  clientAuthenticatorType: "client-secret"
+    This field is present in the export schema but is irrelevant for a
+    public client — it is overridden by publicClient: true.
+
+  standardFlowEnabled    : true
+    Enables the Authorization Code grant. The Angular app redirects the
+    user to Keycloak's /auth endpoint, receives an authorization code,
+    and exchanges it for tokens at the /token endpoint. This is the
+    primary login flow.
+
+  implicitFlowEnabled    : false
+    The legacy Implicit flow (tokens returned directly in the redirect
+    URI fragment) is disabled. It is deprecated in OAuth2 Security BCP
+    RFC 9700 and should remain off.
+
+  directAccessGrantsEnabled : true
+    Enables the Resource Owner Password Credentials (ROPC) grant. This
+    allows a client to POST username + password directly to the /token
+    endpoint and receive tokens without a browser redirect. Enabled here
+    to support automated testing and curl-based token retrieval from the
+    command line. PRODUCTION NOTE: disable this in production to prevent
+    credential stuffing; use Authorization Code + PKCE exclusively.
+
+  serviceAccountsEnabled : false
+    This client does not have a service account — it represents a human
+    user login flow, not a machine identity.
+
+  redirectUris           : ["http://localhost:4200/*"]
+    After a successful login Keycloak will only redirect back to this
+    URI pattern. The wildcard covers any Angular route (e.g.
+    http://localhost:4200/dashboard). If the Angular app is moved to a
+    different origin this list must be updated or Keycloak will reject
+    the login with "Invalid redirect_uri".
+
+  webOrigins             : ["http://localhost:4200"]
+    Keycloak adds this origin to the Access-Control-Allow-Origin header
+    on its /token and /userinfo endpoints. Without this entry the
+    browser would block the token exchange response as a CORS violation.
+
+  attributes:
+    pkce.code.challenge.method : "S256"
+      Forces PKCE code challenge verification using SHA-256. The Angular
+      client (via keycloak-js) generates a random code_verifier, hashes
+      it with SHA-256 to produce the code_challenge, and sends the
+      challenge in the /auth request. Keycloak stores the challenge and
+      verifies the verifier when the code is exchanged at /token. This
+      prevents authorization code interception attacks.
+
+  ·····································
+  3.2  api-gateway
+  ·····································
+
+  clientId               : "api-gateway"
+  name                   : "API Gateway Client"
+  description            : "Confidential client for API Gateway"
+  enabled                : true
+  publicClient           : false
+  secret                 : "api-gateway-secret"
+    The actual secret used in Docker Compose is injected via the
+    GATEWAY_CLIENT_SECRET env var from .env; this export value is the
+    placeholder used during --import-realm.
+
+  bearerOnly             : true
+    A bearer-only client cannot initiate a login flow. It can only
+    validate Bearer tokens presented to it. The API Gateway uses this
+    client registration to verify incoming JWTs without ever redirecting
+    users itself. Keycloak will not issue tokens for this client.
+
+  standardFlowEnabled    : false
+  implicitFlowEnabled    : false
+  directAccessGrantsEnabled : false
+    All interactive flows disabled — consistent with bearer-only mode.
+
+  serviceAccountsEnabled : true
+    A service account record is created even for bearer-only clients in
+    Keycloak. In this project it is not actively used for token issuance
+    but exists as part of Keycloak's internal bookkeeping.
+
+  protocolMappers        : (none defined on the client)
+    Token claims for this client come from the default client scopes
+    (profile, email, roles, web-origins) only.
+
+  ·····································
+  3.3  order-service-client
+  ·····································
+
+  clientId               : "order-service-client"
+  name                   : "Order Service Client"
+  description            : "Confidential client for order-service
+                            machine-to-machine calls using
+                            client_credentials grant"
+  enabled                : true
+  publicClient           : false
+  secret                 : "order-service-secret"
+    Placeholder value. The real secret is ORDER_SERVICE_CLIENT_SECRET
+    from .env / k8s/01-secrets.yaml, passed as an env var to the
+    order-service container and configured in application.yml under
+    spring.security.oauth2.client.registration.keycloak.client-secret.
+
+  standardFlowEnabled    : false
+  implicitFlowEnabled    : false
+  directAccessGrantsEnabled : false
+    All human-user flows are disabled. This client is machine-only.
+
+  serviceAccountsEnabled : true
+    This is the key flag for client_credentials grant support. Enabling
+    it creates a special Keycloak user —
+    "service-account-order-service-client" — that represents the
+    order-service application itself. When order-service POSTs its
+    client_id and client_secret to the /token endpoint with
+    grant_type=client_credentials, Keycloak issues a JWT as if that
+    service account user logged in. The service account's realm roles
+    are embedded in the token.
+
+  protocolMappers:
+    realm-roles-mapper  (oidc-usermodel-realm-role-mapper)
+      Same mapper as angular-client (see Section 4). Without this mapper
+      the service account's roles would not appear in the JWT and all
+      downstream microservice calls from order-service would fail with
+      403 Forbidden.
+
+---------------------------------------------------------------------
+  4. PROTOCOL MAPPERS
+---------------------------------------------------------------------
+
+  Both angular-client and order-service-client define an identical
+  protocol mapper named "realm-roles-mapper". The "roles" client scope
+  defines an equivalent mapper named "realm roles". All three share
+  the same configuration:
+
+  protocolMapper  : "oidc-usermodel-realm-role-mapper"
+    Built-in Keycloak mapper type. Reads the realm roles assigned to
+    the authenticated user (or service account) and writes them into
+    the specified token claim.
+
+  consentRequired : false
+    The user is not shown a consent screen asking permission to include
+    roles in the token. Required consent dialogs are not appropriate for
+    a private application where the realm is controlled by the same
+    organisation as the clients.
+
+  config.multivalued       : "true"
+    The "roles" claim is a JSON array, not a single string. A user with
+    both ROLE_USER and ROLE_ADMIN will have ["ROLE_USER", "ROLE_ADMIN"].
+
+  config.userinfo.token.claim : "true"
+    Roles are also included in the /userinfo endpoint response, not
+    just in the JWT itself.
+
+  config.id.token.claim    : "true"
+    Roles are embedded in the ID token. The Angular app reads roles
+    from the access token (tokenParsed['roles']), not the ID token, but
+    including them in both makes debugging easier.
+
+  config.access.token.claim : "true"
+    Roles are embedded in the access token. This is the claim that
+    Spring Boot's SecurityConfig.java reads via
+    jwt.getClaimAsStringList("roles").
+
+  config.claim.name        : "roles"
+    The JSON key name under which roles appear in the token payload.
+    Spring Boot is configured to look for exactly this key. Changing
+    this name would break JWT validation across all microservices.
+
+  config.jsonType.label    : "String"
+    Each element in the roles array is serialized as a JSON string.
+
+  DUPLICATION WARNING:
+    Because both the client-level mapper and the "roles" client scope
+    mapper are active at the same time, Keycloak may emit the same role
+    twice in the "roles" claim (e.g., ["ROLE_USER", "ROLE_USER",
+    "ROLE_ADMIN"]). The Angular frontend deduplicates with
+    [...new Set(roles)] before checking isAdmin. Spring Boot's
+    SimpleGrantedAuthority handles duplicates harmlessly (Set semantics
+    inside GrantedAuthority collections), but the Angular app guard
+    must always deduplicate — see the Keycloak token reading pattern
+    in CLAUDE.md.
+
+---------------------------------------------------------------------
+  5. USERS
+---------------------------------------------------------------------
+
+  ·····································
+  5.1  user1  (regular user)
+  ·····································
+
+  username      : "user1"
+  email         : "user1@myapp.com"
+  firstName     : "Regular"
+  lastName      : "User"
+  enabled       : true
+  emailVerified : true
+    Marked verified so Keycloak does not show an email-verification
+    prompt on first login. In a real system this is set to true only
+    after the user clicks the verification link.
+
+  credentials:
+    type      : "password"
+    value     : "User@1234!"
+    temporary : false
+      The password is set directly in the export (plain-text in this
+      file; Keycloak hashes it on import using its configured algorithm,
+      default bcrypt). temporary: false means the user is not forced to
+      change their password at first login.
+
+  realmRoles    : ["ROLE_USER"]
+    Grants read-level access to all microservice APIs and the /users,
+    /products, /orders Angular pages.
+
+  ·····································
+  5.2  admin1  (administrator)
+  ·····································
+
+  username      : "admin1"
+  email         : "admin1@myapp.com"
+  firstName     : "Admin"
+  lastName      : "User"
+  enabled       : true
+  emailVerified : true
+
+  credentials:
+    type      : "password"
+    value     : "Admin@1234!"
+    temporary : false
+
+  realmRoles    : ["ROLE_USER", "ROLE_ADMIN"]
+    Grants full access: all read endpoints (ROLE_USER) plus all write
+    endpoints and the /admin Angular page (ROLE_ADMIN). The admin user
+    also sees all orders in the orders page and has the "Place Order"
+    button with a user-selector dropdown.
+
+  ·····································
+  5.3  service-account-order-service-client  (machine identity)
+  ·····································
+
+  username             : "service-account-order-service-client"
+    Keycloak auto-generates this username when serviceAccountsEnabled
+    is true on order-service-client. The format is always
+    "service-account-<clientId>".
+
+  enabled              : true
+  serviceAccountClientId : "order-service-client"
+    Links this user record to its owning client. Keycloak uses this
+    association to issue tokens on behalf of the client when the
+    client_credentials grant is used.
+
+  realmRoles           : ["ROLE_USER", "ROLE_ADMIN"]
+    The service account must have both roles so that when order-service
+    calls user-service or product-service, the Bearer token it carries
+    satisfies those services' @PreAuthorize checks. Without ROLE_USER
+    the calls would fail with 403.
+
+  Note: this user has no credentials block — service accounts never
+  authenticate with a password. Authentication is via the client secret
+  of order-service-client.
+
+---------------------------------------------------------------------
+  6. CLIENT SCOPES
+---------------------------------------------------------------------
+
+  Client scopes are reusable bundles of claims and mappers that can be
+  applied to multiple clients. This export defines one custom scope.
+
+  name                           : "roles"
+  description                    : "Realm and client roles scope"
+  protocol                       : "openid-connect"
+
+  attributes:
+    include.in.token.scope       : "true"
+      This scope is included in the token even when the client does not
+      explicitly request it as a scope parameter. It is always active
+      for clients where it is set as a default scope.
+
+    display.on.consent.screen    : "true"
+      If a consent screen were ever enabled this scope would appear
+      as a listed permission. Currently consent is off (see clients
+      above) so this has no visible effect.
+
+  protocolMappers:
+    "realm roles"  (oidc-usermodel-realm-role-mapper)
+      Identical configuration to the client-level mapper described in
+      Section 4. This scope-level mapper is what causes the duplication
+      warning: when this scope is active AND the client has its own
+      realm-roles-mapper, Keycloak calls both mappers and the roles
+      array receives duplicate entries. See the duplication note in
+      Section 4.
+
+---------------------------------------------------------------------
+  7. DEFAULT CLIENT SCOPE ASSIGNMENTS
+---------------------------------------------------------------------
+
+  defaultDefaultClientScopes : ["web-origins", "profile", "roles", "email"]
+    These four scopes are automatically attached to every client in the
+    realm unless explicitly removed. They are always included in tokens
+    without the client needing to request them:
+
+    web-origins
+      Adds the client's configured webOrigins to the CORS allowed-origins
+      list on Keycloak's token endpoints. Required for browser clients.
+
+    profile
+      Includes standard OpenID Connect user claims: name, given_name,
+      family_name, preferred_username, updated_at. The ID token carries
+      these claims; the access token may not include all of them depending
+      on Keycloak version. This is why the Angular app reads
+      preferred_username from idTokenParsed, not tokenParsed.
+
+    roles
+      The custom scope defined in Section 6. Including it here ensures
+      realm roles appear in tokens for every client without any per-client
+      mapper configuration.
+
+    email
+      Includes email and email_verified claims in tokens.
+
+  defaultOptionalClientScopes : ["offline_access", "address", "phone"]
+    These scopes are available but not included by default. A client
+    must explicitly request them as scope parameters.
+
+    offline_access
+      When requested, Keycloak issues an offline refresh token that
+      survives server restarts and does not expire until explicitly
+      revoked. Not used in this project's normal login flow.
+
+    address
+      Includes postal address claims (address, formatted, etc.).
+      Not used.
+
+    phone
+      Includes phone_number and phone_number_verified claims.
+      Not used.
+
+---------------------------------------------------------------------
+  8. DECODED JWT ANATOMY
+---------------------------------------------------------------------
+
+  What a valid access token looks like for user1 after login:
+
+  Header:
+    {
+      "alg": "RS256",
+      "typ": "JWT",
+      "kid": "<realm-signing-key-id>"
+    }
+
+  Payload (key claims only):
+    {
+      "exp": <now + 300>,
+      "iat": <now>,
+      "jti": "<unique-token-id>",
+      "iss": "http://localhost:8080/realms/myapp-realm",
+      "aud": "account",
+      "sub": "<user1-uuid>",
+      "typ": "Bearer",
+      "azp": "angular-client",
+      "session_state": "<session-uuid>",
+      "preferred_username": "user1",
+      "email": "user1@myapp.com",
+      "email_verified": true,
+      "name": "Regular User",
+      "given_name": "Regular",
+      "family_name": "User",
+      "roles": ["ROLE_USER"]       ← written by the realm-roles-mapper
+    }
+
+  What a client_credentials token looks like for order-service:
+
+  Payload (key claims only):
+    {
+      "exp": <now + 300>,
+      "iat": <now>,
+      "iss": "http://localhost:8080/realms/myapp-realm",
+      "sub": "<service-account-uuid>",
+      "typ": "Bearer",
+      "azp": "order-service-client",
+      "preferred_username": "service-account-order-service-client",
+      "roles": ["ROLE_USER", "ROLE_ADMIN"]  ← from service account roles
+    }
+
+  Spring Boot's SecurityConfig.java extracts roles like this:
+    List<String> roles = jwt.getClaimAsStringList("roles");
+    // → ["ROLE_USER"] for user1
+    // → ["ROLE_USER", "ROLE_ADMIN"] for admin1 / order-service tokens
+
+---------------------------------------------------------------------
+  9. IMPORT MECHANISM
+---------------------------------------------------------------------
+
+  HOW IT WORKS:
+    Keycloak reads this file at startup when the container is launched
+    with the command argument "--import-realm". In Docker Compose the
+    file is bind-mounted into the container at the path
+    /opt/keycloak/data/import/realm-export.json.
+
+  IDEMPOTENCY:
+    If the realm "myapp-realm" already exists (e.g. after a container
+    restart), Keycloak skips the import and leaves the existing realm
+    unchanged. The import only runs if the realm does not exist. This
+    means:
+      - Stopping and restarting the container does NOT reset the realm.
+      - To force a re-import, the keycloak-db volume must be dropped
+        first: docker compose down -v && docker compose up --build -d
+
+  WHAT IS NOT IN THE EXPORT:
+    - Keycloak's own admin user (admin / Admin@1234!) — this is created
+      by the KEYCLOAK_ADMIN and KEYCLOAK_ADMIN_PASSWORD env vars, not
+      by the realm export.
+    - SMTP server settings for email delivery (reset password, verify).
+    - Theme customisations, localization overrides.
+    - Token introspection endpoint settings.
+    - Realm-level brute-force thresholds (only the enabled flag is here;
+      the numeric thresholds use Keycloak defaults).
+    - The actual RSA signing key pair (generated by Keycloak at first
+      start and stored in the database).
+
+---------------------------------------------------------------------
+  10. SECURITY NOTES & PRODUCTION CHECKLIST
+---------------------------------------------------------------------
+
+  The current realm-export.json is configured for local development.
+  Before any production deployment the following fields must be reviewed:
+
+  sslRequired: "none"
+    → Change to "external" or "all". Without SSL enforcement, tokens
+      travel in plain text over HTTP.
+
+  directAccessGrantsEnabled: true  (on angular-client)
+    → Set to false. The Resource Owner Password Credentials grant
+      bypasses PKCE and is a target for credential stuffing attacks.
+      Authorization Code + PKCE is sufficient for the Angular SPA.
+
+  secrets in the export (angular-client has no secret; api-gateway
+    and order-service-client have placeholder secrets)
+    → Replace "api-gateway-secret" and "order-service-secret" with
+      strong randomly generated values. In Docker Compose these come
+      from .env; in Kubernetes from k8s/01-secrets.yaml. The export
+      values only apply during the first --import-realm pass.
+
+  accessTokenLifespan: 300 (5 minutes)
+    → Acceptable for production. Shorter is better for security;
+      longer reduces Keycloak load from refresh requests.
+
+  bruteForceProtected: true
+    → Already enabled. Configure numeric thresholds in the Admin
+      Console (failure count, wait increment, max wait, quick login
+      check) for your threat model.
+
+  registrationAllowed: false
+    → Correct for an internal application. Do not enable self-
+      registration without adding email verification and CAPTCHA.
+
+  resetPasswordAllowed: true
+    → Requires SMTP configuration in the Admin Console for the reset
+      email to be delivered. Without SMTP the "Forgot password?" link
+      is visible but the email never arrives.
+
+=====================================================================
 =====================================================================
