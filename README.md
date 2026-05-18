@@ -1,2 +1,4506 @@
-# MyFullStackSampleWithKeyCloakSample1
-MyFullStackSampleWithKeyCloackSample1
+=====================================================================
+  FULL PROJECT FILE DOCUMENTATION
+  Full-Stack Angular + Spring Boot Microservices
+  with Keycloak, Grafana & OpenTelemetry
+  Includes: Docker Compose + Kubernetes deployment files
+=====================================================================
+
+Every file is listed below, grouped by project/component.
+Each entry explains what the file is, why it exists, and what it does.
+
+=====================================================================
+  ROOT LEVEL
+=====================================================================
+
+docker-compose.yml
+  PURPOSE : Master orchestration file that defines and wires all 15
+            Docker containers together into a single deployable stack.
+  WHAT IT DOES :
+    - Declares a shared Docker network (app-network) so every container
+      can reach others by service name (e.g. "keycloak", "loki").
+    - Declares 8 named volumes for persistent data (postgres databases,
+      prometheus metrics, loki logs, tempo traces, grafana dashboards).
+    - Defines all 15 services with their images, environment variables,
+      port mappings, health checks, startup dependencies, and restart
+      policies.
+    - Enforces startup order: databases become healthy before Keycloak
+      starts; Keycloak becomes healthy before api-gateway and
+      microservices start; config-server becomes healthy before all
+      Spring Boot apps start.
+    - order-service additionally depends on user-service and
+      product-service being started (service_started condition).
+    - Health checks use wget (not curl) for Spring Boot services since
+      eclipse-temurin:21-jre-alpine does not include curl. Keycloak's
+      health check uses /bin/bash /dev/tcp to probe port 8080 since the
+      Keycloak UBI9 image also has no curl.
+    - All Spring Boot services receive SPRING_SECURITY_OAUTH2_RESOURCESERVER
+      _JWT_JWK_SET_URI pointing to http://keycloak:8080/... (Docker-
+      internal) and KEYCLOAK_ISSUER_URI=http://localhost:8080/... (actual
+      JWT issuer). This split bypasses Keycloak's OIDC discovery document
+      (which contains localhost URLs unreachable from inside containers)
+      while still validating the iss claim in every JWT.
+
+.env
+  PURPOSE : Central store for all secrets and configurable values used
+            by docker-compose.yml.
+  WHAT IT DOES :
+    - Holds passwords for Keycloak admin, Keycloak DB, user-service DB,
+      product-service DB, order-service DB (ORDER_DB_PASSWORD), the
+      order-service Keycloak client secret (ORDER_SERVICE_CLIENT_SECRET),
+      Config Server, and Grafana.
+    - Docker Compose reads this file automatically and substitutes
+      ${VARIABLE} placeholders in docker-compose.yml.
+    - Keeps secrets out of docker-compose.yml so it is safe to commit
+      the compose file while keeping .env in .gitignore.
+
+PLAN.md
+  PURPOSE : Architecture reference document for the whole project.
+  WHAT IT DOES :
+    - Contains an ASCII diagram of the full service topology.
+    - Lists every service with its port and role.
+    - Documents the security flow (Angular → Keycloak → Gateway → Services).
+    - Lists all API endpoints and which role is required for each.
+    - Lists all Angular pages and their route guards.
+    - Shows the observability signal routing (metrics/traces/logs).
+    - Provides the Quick Start command sequence.
+
+cmd.txt
+  PURPOSE : Ready-to-run command reference for operating the project.
+  WHAT IT DOES :
+    - Documents docker compose up --build -d to start everything.
+    - Lists all access URLs with ports.
+    - Lists all credentials (Keycloak admin, test users, Grafana).
+    - Shows how to get a Keycloak token via curl and test the API.
+    - Shows how to stop services and rebuild individual containers.
+
+docs.txt
+  PURPOSE : This file. Complete per-file documentation for the project,
+            grouped by component.
+
+
+=====================================================================
+  CONFIG-REPO  (Centralized Configuration Store)
+=====================================================================
+
+  The config-repo directory acts as a Git-less native configuration
+  repository mounted into the Config Server container. Spring Boot
+  services fetch their configuration from here at startup instead of
+  bundling it inside their own JARs. This allows changing configuration
+  without rebuilding Docker images.
+
+config-repo/application.yml
+  PURPOSE : Shared baseline configuration applied to ALL microservices.
+  WHAT IT DOES :
+    - Sets JPA/Hibernate options (ddl-auto: update, no SQL logging).
+    - Exposes Spring Actuator endpoints: health, info, metrics, prometheus.
+    - Enables Prometheus metrics export via Micrometer.
+    - Sets OpenTelemetry trace sampling to 100% (probability: 1.0).
+    - Defines the logging pattern that injects traceId and spanId into
+      every log line, enabling log-to-trace correlation in Grafana.
+    - Enables DEBUG logging for com.myapp packages.
+
+config-repo/user-service.yml
+  PURPOSE : Overrides and additions specific to the user-service only.
+  WHAT IT DOES :
+    - Explicitly sets the PostgreSQL JDBC driver class.
+    - Sets the Hibernate dialect to PostgreSQLDialect.
+    - Enables DEBUG logging for the user-service package.
+    - Values here are merged on top of application.yml by the Config
+      Server when user-service requests its configuration.
+
+config-repo/product-service.yml
+  PURPOSE : Overrides and additions specific to the product-service only.
+  WHAT IT DOES :
+    - Same structure as user-service.yml but scoped to product-service.
+    - Explicitly sets PostgreSQL driver and dialect.
+    - Enables DEBUG logging for the product-service package.
+
+
+=====================================================================
+  CONFIG-SERVER  (Spring Cloud Config Server)
+=====================================================================
+
+  A standalone Spring Boot application that acts as a centralized
+  configuration server. All other Spring Boot services connect to it
+  at startup to fetch their application.yml properties. This means
+  you can change configuration in config-repo/ without rebuilding
+  any service Docker image.
+
+config-server/pom.xml
+  PURPOSE : Maven build descriptor for the config-server module.
+  WHAT IT DOES :
+    - Inherits from spring-boot-starter-parent 3.3.4.
+    - Declares Spring Cloud BOM version 2023.0.3 for dependency management.
+    - Pulls in: spring-cloud-config-server (the core server),
+      spring-boot-starter-security (HTTP Basic auth to protect the
+      /config endpoints), spring-boot-starter-actuator (health check
+      so docker-compose healthcheck works).
+    - Configures the Spring Boot Maven plugin to produce a fat JAR.
+
+config-server/src/main/resources/application.yml
+  PURPOSE : Runtime configuration for the Config Server itself.
+  WHAT IT DOES :
+    - Binds the server to port 8888.
+    - Activates the "native" profile so it reads config from the local
+      filesystem instead of a remote Git repository.
+    - Points the native search location to /config-repo (the volume
+      mounted from config-repo/ on the host).
+    - Sets the HTTP Basic username to "configuser" and password from
+      the SPRING_SECURITY_USER_PASSWORD environment variable.
+    - Exposes /actuator/health so the Docker health check can verify
+      the server is ready before dependent services start.
+
+config-server/src/main/java/.../ConfigServerApplication.java
+  PURPOSE : Spring Boot entry point for the Config Server.
+  WHAT IT DOES :
+    - Annotated with @SpringBootApplication to enable component scanning,
+      auto-configuration, and property binding.
+    - Annotated with @EnableConfigServer which activates all Spring Cloud
+      Config Server infrastructure (REST endpoints at /{application}/{profile},
+      property source resolution, encryption support, etc.).
+    - Contains only the main() method — no custom logic needed; the
+      framework handles everything.
+
+config-server/Dockerfile
+  PURPOSE : Multi-stage Docker build definition for the Config Server.
+  WHAT IT DOES :
+    - Stage 1 (build): Uses maven:3.9-eclipse-temurin-21 to resolve
+      dependencies (mvn dependency:go-offline) and then build the fat JAR
+      (mvn package -DskipTests). Separating dependency resolution from
+      compilation enables Docker layer caching — Maven only re-downloads
+      dependencies when pom.xml changes.
+    - Stage 2 (runtime): Uses the slim eclipse-temurin:21-jre-alpine image
+      (no JDK, no Maven) to copy only the JAR and run it.
+    - Result: a minimal image (~200MB) instead of a full JDK+Maven image.
+
+---------------------------------------------------------------------
+  CONCEPT: SPRING_PROFILES_ACTIVE: native
+---------------------------------------------------------------------
+
+  WHAT IT IS :
+    An environment variable (or application.yml property) passed to the
+    Spring Cloud Config Server that activates the built-in "native" Spring
+    profile. It is set as:
+
+        SPRING_PROFILES_ACTIVE: native          (docker-compose.yml)
+        spring.profiles.active=native           (application.yml equivalent)
+
+  WHAT "native" MEANS :
+    Spring Cloud Config Server supports two source backends:
+
+    1. Git backend (default) — clones a remote Git repository and serves
+       config files from it. Requires a valid Git URL.
+
+    2. Native backend (activated by the "native" profile) — reads config
+       files directly from the local filesystem or classpath. No Git
+       repository is needed. The search locations are configured with:
+
+           spring.cloud.config.server.native.search-locations: file:/config-repo
+
+    This project uses the native backend because config-repo/ is a plain
+    directory on the host that gets bind-mounted into the container at
+    /config-repo. There is no Git remote — files are edited directly.
+
+  HOW IT WORKS IN THIS PROJECT :
+    1. docker-compose.yml passes SPRING_PROFILES_ACTIVE=native to the
+       config-server container as an environment variable.
+    2. Spring Boot sees the active profile is "native" and auto-configures
+       the NativeEnvironmentRepository instead of the default Git one.
+    3. The search location is set to file:/config-repo (the bind-mount).
+    4. When user-service starts and requests its config via:
+           GET http://config-server:8888/user-service/default
+       the Config Server reads /config-repo/application.yml and
+       /config-repo/user-service.yml from disk, merges them, and
+       returns the combined property set as JSON.
+    5. Changes to config-repo/ files on the host are immediately visible
+       inside the container (bind-mount), so a service restart picks
+       them up without rebuilding any image.
+
+  WHY "native" AND NOT GIT :
+    - No Git repository overhead for a local development stack.
+    - Config files live alongside the source code in the same repo root,
+      making them easy to edit and review.
+    - In a production or CI environment you would switch to the Git backend
+      so config history is tracked, changes are auditable, and the Config
+      Server can refresh properties at runtime without a service restart.
+
+  WHERE IT APPEARS IN THIS PROJECT :
+    - docker-compose.yml → config-server service → environment section.
+    - config-server/src/main/resources/application.yml →
+        spring.profiles.active: native
+        spring.cloud.config.server.native.search-locations: file:/config-repo
+    - k8s/spring-cloud/10-config-server.yaml → env section of the
+      config-server container (same variable, same value).
+
+
+=====================================================================
+  API-GATEWAY  (Spring Cloud Gateway)
+=====================================================================
+
+  The single entry point for all external traffic. The Angular frontend
+  and any API client talk only to this service. It validates the Keycloak
+  JWT, routes requests to the correct microservice, and forwards the JWT
+  downstream so microservices can also validate it (defense in depth).
+
+api-gateway/pom.xml
+  PURPOSE : Maven build descriptor for the api-gateway module.
+  WHAT IT DOES :
+    - Declares spring-cloud-starter-gateway: the reactive (Netty-based)
+      API gateway — handles routing, filters, CORS.
+    - Declares spring-boot-starter-oauth2-resource-server: validates
+      incoming JWTs against Keycloak's public keys (JWKS endpoint).
+    - Declares spring-cloud-starter-config: enables fetching configuration
+      from the Config Server at startup.
+    - Declares micrometer-registry-prometheus: exposes /actuator/prometheus
+      endpoint for Prometheus to scrape metrics.
+    - Declares micrometer-tracing-bridge-otel + opentelemetry-exporter-otlp:
+      sends distributed traces to the OTel Collector.
+    - NOTE: spring-boot-starter-oauth2-client is intentionally NOT included.
+      TokenRelay= is not used (see application.yml note). Adding the client
+      starter without OAuth2 client registrations can cause runtime issues.
+
+api-gateway/src/main/resources/application.yml
+  PURPOSE : Runtime configuration for the API Gateway.
+  WHAT IT DOES :
+    - Binds to port 8090.
+    - Configures the Config Server import URI so the gateway fetches
+      shared config at startup.
+    - Sets JWT validation via two properties (see JWT split note below):
+        spring.security.oauth2.resourceserver.jwt.issuer-uri  — iss claim validation
+        spring.security.oauth2.resourceserver.jwt.jwk-set-uri — key fetch URL
+    - Defines global CORS policy allowing requests from http://localhost:4200
+      (the Angular app) with all HTTP methods and Authorization header.
+    - Defines three routes with NO filters:
+        /api/users/**   → forwards to http://user-service:8081
+        /api/products/** → forwards to http://product-service:8082
+        /api/orders/**  → forwards to http://order-service:8083
+    - The Authorization: Bearer <JWT> header from the incoming request is
+      forwarded to downstream services automatically by Spring Cloud Gateway
+      without any explicit TokenRelay= filter. TokenRelay= was removed
+      because it is designed for OAuth2 login flows, not resource-server
+      (JWT) mode, and caused 502 errors when no OAuth2 client registration
+      was configured.
+    - Configures OTel exporter endpoint for trace export.
+
+  JWT VALIDATION SPLIT (Docker Compose):
+    With KC_HOSTNAME=localhost, Keycloak's OIDC discovery document returns
+    jwks_uri: http://localhost:8080/... — which inside Docker resolves to
+    the container itself (not Keycloak), causing JWK Set fetches to fail.
+    The fix is to bypass OIDC discovery entirely:
+      KEYCLOAK_ISSUER_URI=http://localhost:8080/realms/myapp-realm
+        → spring.security.oauth2.resourceserver.jwt.issuer-uri
+        → used only to validate the iss claim in incoming JWTs (matches
+          the actual value Keycloak puts in tokens)
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI=http://keycloak:8080/...
+        → spring.security.oauth2.resourceserver.jwt.jwk-set-uri
+        → when jwk-set-uri is set, Spring Boot fetches keys directly from
+          this URL without doing OIDC discovery, using the Docker-internal
+          keycloak hostname which is always reachable
+    When both properties are set, jwk-set-uri takes precedence for the
+    decoder and issuer-uri is used only for the iss claim validator.
+
+api-gateway/src/main/java/.../ApiGatewayApplication.java
+  PURPOSE : Spring Boot entry point for the API Gateway.
+  WHAT IT DOES :
+    - Standard @SpringBootApplication bootstrapper.
+    - Spring Cloud Gateway auto-configures all routes from application.yml.
+
+api-gateway/src/main/java/.../config/SecurityConfig.java
+  PURPOSE : Security configuration for the reactive (WebFlux) gateway.
+  WHAT IT DOES :
+    - Uses ServerHttpSecurity (reactive security) not HttpSecurity.
+      This is the WebFlux equivalent of the Servlet HttpSecurity used
+      in the microservices.
+    - Disables CSRF (safe for the same reason as the microservices:
+      JWT bearer auth has no session cookie attack surface).
+    - Permits /actuator/** without authentication (for health checks
+      and Prometheus scraping).
+    - Requires authentication for all other paths.
+    - Configures OAuth2 resource server JWT validation with a custom
+      ReactiveJwtAuthenticationConverterAdapter that reads the "roles"
+      claim from the Keycloak JWT and maps each value to a Spring
+      Security GrantedAuthority prefixed with "ROLE_".
+    - No sessionManagement() call: the gateway runs on Spring WebFlux
+      (Project Reactor / Netty), which does not use javax.servlet
+      HttpSession. The reactive security layer rebuilds the
+      ReactiveSecurityContext from the JWT on every request without
+      creating a WebSession, so STATELESS behaviour is automatic.
+      The microservices need the explicit STATELESS line because they
+      run on the Servlet stack (Tomcat) where IF_REQUIRED is the
+      default and would otherwise create sessions. See the CONCEPT
+      block in the user-service section for the full explanation.
+
+api-gateway/Dockerfile
+  PURPOSE : Multi-stage Docker build for the API Gateway.
+  WHAT IT DOES :
+    - Same two-stage build pattern as config-server/Dockerfile.
+    - Exposes port 8090.
+
+
+=====================================================================
+  USER-SERVICE  (Microservice 1 — User Management)
+=====================================================================
+
+  A Spring Boot REST microservice responsible for CRUD operations on
+  User entities. It has its own dedicated PostgreSQL database and
+  validates JWTs independently from the gateway (defense in depth).
+  All logs are shipped to Loki and all traces to the OTel Collector.
+
+user-service/pom.xml
+  PURPOSE : Maven build descriptor for user-service.
+  WHAT IT DOES :
+    - Declares spring-boot-starter-web: embedded Tomcat HTTP server.
+    - Declares spring-boot-starter-data-jpa: JPA/Hibernate ORM layer.
+    - Declares postgresql driver: JDBC driver for PostgreSQL.
+    - Declares spring-boot-starter-oauth2-resource-server: JWT validation.
+    - Declares spring-cloud-starter-config: Config Server client.
+    - Declares spring-boot-starter-actuator + micrometer-registry-prometheus:
+      health/metrics endpoints and Prometheus export.
+    - Declares micrometer-tracing-bridge-otel + opentelemetry-exporter-otlp:
+      distributed tracing to OTel Collector.
+    - Declares loki-logback-appender 1.5.1: ships logback log events
+      directly to Loki via HTTP without needing a log shipper agent.
+    - Declares spring-boot-starter-validation: Bean Validation (JSR-380)
+      for request body validation.
+    - Declares lombok: eliminates boilerplate getters/setters/constructors.
+
+user-service/src/main/resources/application.yml
+  PURPOSE : Runtime configuration for the user-service.
+  WHAT IT DOES :
+    - Binds to port 8081.
+    - Imports shared config from the Config Server.
+    - Sets the PostgreSQL JDBC URL, username, and password from environment
+      variables (so they differ between local dev and Docker).
+    - Configures the Keycloak JWT issuer URI for token validation.
+    - Sets the OTel Collector endpoint for trace export.
+    - Sets the Loki URL for log shipping (read by logback-spring.xml).
+
+user-service/src/main/resources/logback-spring.xml
+  PURPOSE : Custom Logback configuration that ships logs to Loki.
+  WHAT IT DOES :
+    - Reads spring.application.name and loki.url from Spring properties.
+    - Defines a CONSOLE appender that prints structured log lines including
+      traceId and spanId so you can correlate logs with traces.
+    - Defines a LOKI appender (Loki4jAppender) that:
+        * Pushes log batches to Loki's HTTP push endpoint.
+        * Labels each log stream with app name, hostname, and log level
+          (enabling filtering in Grafana by service or severity).
+        * Formats log messages as structured text including traceId/spanId
+          for correlation with Tempo traces.
+    - Attaches both appenders to the root logger so logs go to both
+      console (for docker compose logs) and Loki simultaneously.
+
+user-service/src/main/java/.../UserServiceApplication.java
+  PURPOSE : Spring Boot entry point for the user-service.
+  WHAT IT DOES :
+    - Standard @SpringBootApplication bootstrapper.
+
+user-service/src/main/java/.../model/User.java
+  PURPOSE : JPA entity representing a user record in the database.
+  WHAT IT DOES :
+    - Maps to the "users" table in the userdb PostgreSQL database.
+    - Fields: id (auto-generated PK), username (unique, not null),
+      email (unique, not null), firstName, lastName, createdAt.
+    - @PrePersist sets createdAt to the current timestamp automatically
+      when a new record is inserted, so callers never need to set it.
+    - Lombok @Getter/@Setter/@NoArgsConstructor eliminate boilerplate.
+
+user-service/src/main/java/.../repository/UserRepository.java
+  PURPOSE : Spring Data JPA repository for User entities.
+  WHAT IT DOES :
+    - Extends JpaRepository<User, Long> to inherit standard CRUD methods
+      (save, findById, findAll, deleteById, etc.) with no implementation needed.
+    - Declares custom query methods: findByUsername, findByEmail,
+      existsByUsername, existsByEmail — Spring Data derives the SQL
+      automatically from the method names.
+
+user-service/src/main/java/.../service/UserService.java
+  PURPOSE : Business logic layer for user operations.
+  WHAT IT DOES :
+    - @Transactional(readOnly=true) on the class makes all read operations
+      use a read-only transaction (better DB performance).
+    - @Transactional on write methods (create, update, delete) ensures
+      changes are committed atomically or rolled back on error.
+    - Logs every operation with SLF4J so the log stream includes traceId
+      for end-to-end trace correlation.
+    - Throws NoSuchElementException for missing users, caught by ExceptionHandler.
+
+user-service/src/main/java/.../controller/UserController.java
+  PURPOSE : REST API controller exposing User CRUD endpoints.
+  WHAT IT DOES :
+    - Maps to base path /api/users.
+    - GET /api/users         → returns all users (ROLE_USER or ROLE_ADMIN)
+    - GET /api/users/{id}    → returns one user (ROLE_USER or ROLE_ADMIN)
+    - POST /api/users        → creates a user (ROLE_ADMIN only)
+    - PUT /api/users/{id}    → updates a user (ROLE_ADMIN only)
+    - DELETE /api/users/{id} → deletes a user (ROLE_ADMIN only)
+    - @PreAuthorize annotations enforce role-based access at the method
+      level (requires @EnableMethodSecurity in SecurityConfig).
+    - @Valid triggers Bean Validation on the request body.
+
+user-service/src/main/java/.../config/SecurityConfig.java
+  PURPOSE : Web security configuration for user-service.
+  WHAT IT DOES :
+    - @EnableWebSecurity activates Spring Security.
+    - @EnableMethodSecurity enables @PreAuthorize on controller methods.
+    - Disables CSRF (safe — see the CONCEPT block below for the full
+      explanation of why this remains safe even with sessions enabled).
+    - Sets SessionCreationPolicy.IF_REQUIRED — the Servlet container
+      may create an HttpSession when application code requests one.
+      Spring Security itself will not create a session purely to store
+      auth state; only explicit calls to request.getSession() by
+      developer code will create one.
+    - Wires NullSecurityContextRepository — Spring Security does NOT
+      save or load the SecurityContext (the authenticated principal and
+      roles) to or from the HttpSession. The JWT is re-validated from
+      the Authorization header on every single request regardless of
+      whether a session exists. See the CONCEPT block below.
+    - Permits /actuator/** (health, prometheus) without a token.
+    - All other requests require a valid JWT.
+    - Installs a JwtAuthenticationConverter that reads the "roles" claim
+      from the Keycloak JWT and converts each role to a Spring Security
+      GrantedAuthority, enabling hasRole() and @PreAuthorize to work.
+
+---------------------------------------------------------------------
+  CONCEPT: Session Management — IF_REQUIRED + NullSecurityContextRepository
+---------------------------------------------------------------------
+
+  THE CONFIGURATION IN CODE (user-service, product-service, and order-service) :
+      .sessionManagement(session ->
+          session.sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED))
+      .securityContext(ctx ->
+          ctx.securityContextRepository(new NullSecurityContextRepository()))
+
+  WHY TWO SETTINGS ARE NEEDED — THE PROBLEM THEY SOLVE TOGETHER :
+    Allowing an HttpSession to exist introduces a subtle but critical
+    security risk if done naively. This is why a single change to
+    IF_REQUIRED is not enough on its own.
+
+    Spring Security stores the authenticated principal (SecurityContext)
+    in the HttpSession by default. On later requests it reads the
+    SecurityContext back from the session, meaning the JWT in the
+    Authorization header is NOT re-checked — the session is trusted
+    instead. This has two serious consequences:
+
+      1. A stolen JSESSIONID cookie grants full API access with no JWT
+         needed. The attacker never needs to touch Keycloak.
+      2. A revoked or expired Keycloak token still works as long as the
+         old session is alive, because the service reads auth state from
+         memory, not from the token.
+
+    The two-setting combination fixes this:
+      - IF_REQUIRED  : the Servlet container is allowed to create and
+                       serve sessions when developer code asks for one.
+      - NullSecurityContextRepository : Spring Security never writes the
+                       SecurityContext into the session and never reads
+                       it back. Authentication always comes from the JWT.
+
+  THE FOUR SessionCreationPolicy VALUES :
+
+    Policy         | Spring Security creates session? | Reads existing?
+    ---------------|----------------------------------|----------------
+    ALWAYS         | Yes, on every request            | Yes
+    IF_REQUIRED    | Yes, when it needs one           | Yes  ← now used
+    NEVER          | No                               | Yes (if present)
+    STATELESS      | No                               | No   ← previous
+
+    With IF_REQUIRED + NullSecurityContextRepository the effective
+    behaviour is: sessions can exist and carry developer data, but
+    Spring Security acts as if they do not exist for auth purposes.
+
+  HOW AUTHENTICATION STILL WORKS REQUEST-BY-REQUEST :
+    The NullSecurityContextRepository breaks the session-auth link so
+    every request is independently verified:
+
+      1. BearerTokenAuthenticationFilter extracts the JWT from the
+         Authorization: Bearer header.
+      2. Spring Security validates the JWT signature against Keycloak's
+         JWKS endpoint (fetched once, cached).
+      3. JwtAuthenticationConverter reads the "roles" claim and builds
+         GrantedAuthority objects (ROLE_USER, ROLE_ADMIN).
+      4. A JwtAuthenticationToken is stored in the thread-local
+         SecurityContextHolder for the lifetime of this request.
+      5. @PreAuthorize and hasRole() run against that in-memory context.
+      6. At request end the SecurityContextHolder is cleared.
+         NullSecurityContextRepository ensures nothing is written to the
+         session. The session itself (if it exists) is untouched.
+
+  HOW DEVELOPER CODE USES THE SESSION :
+    Any controller or service can access the HttpSession normally. Spring
+    Security does not interfere with the session contents — it only
+    stops using the session for auth state.
+
+    Injecting via method parameter (Spring MVC creates the session
+    automatically when the parameter is declared):
+
+        @GetMapping("/cart")
+        public CartDto getCart(HttpSession session) {
+            return (CartDto) session.getAttribute("cart");
+        }
+
+        @PostMapping("/cart")
+        public void addToCart(@RequestBody CartItem item, HttpSession session) {
+            CartDto cart = (CartDto) session.getAttribute("cart");
+            if (cart == null) cart = new CartDto();
+            cart.add(item);
+            session.setAttribute("cart", item);
+        }
+
+    Using HttpServletRequest for controlled creation:
+
+        HttpSession session = request.getSession(true);  // create if absent
+        HttpSession session = request.getSession(false); // null if absent
+
+    Configuring session timeout (in config-repo/application.yml or
+    the service's own application.yml):
+
+        server:
+          servlet:
+            session:
+              timeout: 30m   # default is 30 minutes
+
+  WHY csrf.disable() REMAINS SAFE WITH SESSIONS ENABLED :
+    CSRF attacks exploit the fact that browsers automatically attach
+    cookies (like JSESSIONID) to cross-site requests, letting a
+    malicious page trigger authenticated actions on a victim's behalf.
+    The attack works only if that cookie IS the credential — i.e., if
+    the server grants access based on the session cookie alone.
+
+    In this project the session cookie is never the credential.
+    NullSecurityContextRepository means Spring Security ignores the
+    session for authentication entirely. Every request must carry a
+    valid Authorization: Bearer <JWT> header. A cross-site request
+    cannot set that header (CORS + browser security model prevent it),
+    so there is no CSRF vector even though a JSESSIONID cookie may be
+    present.
+
+    DANGER — what would make CSRF protection necessary again:
+      - Removing NullSecurityContextRepository while keeping IF_REQUIRED.
+        Then Spring Security would trust the session-stored context and
+        the JSESSIONID cookie would become a sufficient credential.
+      - Switching to form-login or remember-me authentication.
+      - Configuring any authentication mechanism that uses a cookie.
+
+  WHY THE API GATEWAY HAS NO sessionManagement() CALL :
+    The API Gateway runs on Spring WebFlux (Project Reactor / Netty),
+    not the Servlet stack. It uses ServerHttpSecurity, not HttpSecurity.
+    WebFlux does not use javax.servlet.http.HttpSession at all — it has
+    its own WebSession abstraction. When oauth2ResourceServer JWT is
+    configured on the reactive gateway, Spring Security's reactive layer
+    reconstructs the ReactiveSecurityContext from the JWT on each request
+    without touching a WebSession. Therefore no sessionManagement() or
+    securityContext() override is needed in the gateway; these settings
+    only apply to the Servlet-based microservices (user-service,
+    product-service, and order-service) where IF_REQUIRED is the
+    default and would otherwise cause Spring Security to cache the
+    SecurityContext in the session.
+
+user-service/src/main/java/.../config/ExceptionHandler.java
+  PURPOSE : Global exception handler that converts exceptions to HTTP responses.
+  WHAT IT DOES :
+    - @RestControllerAdvice intercepts exceptions thrown by any controller.
+    - Catches NoSuchElementException (thrown by UserService.findById when
+      a user doesn't exist) and returns a 404 JSON response with a
+      timestamp, status code, and error message.
+
+user-service/Dockerfile
+  PURPOSE : Multi-stage Docker build for user-service.
+  WHAT IT DOES :
+    - Same two-stage Maven → JRE pattern as other services.
+    - Exposes port 8081.
+
+
+=====================================================================
+  PRODUCT-SERVICE  (Microservice 2 — Product Management)
+=====================================================================
+
+  A Spring Boot REST microservice responsible for CRUD operations on
+  Product entities. Structurally identical to user-service but with its
+  own domain model, its own PostgreSQL database, and its own port.
+
+product-service/pom.xml
+  PURPOSE : Maven build descriptor for product-service.
+  WHAT IT DOES :
+    - Identical dependency set to user-service/pom.xml (web, JPA,
+      postgres, oauth2-resource-server, config, actuator, prometheus,
+      OTel, loki-logback, validation, lombok).
+    - Artifact ID is "product-service".
+
+product-service/src/main/resources/application.yml
+  PURPOSE : Runtime configuration for product-service.
+  WHAT IT DOES :
+    - Binds to port 8082.
+    - Same structure as user-service/application.yml but points to
+      postgres-product:5432/productdb.
+
+product-service/src/main/resources/logback-spring.xml
+  PURPOSE : Custom Logback config identical in structure to user-service's.
+  WHAT IT DOES :
+    - Ships logs to Loki labeled with app=product-service.
+    - Injects traceId/spanId into every log line for trace correlation.
+
+product-service/src/main/java/.../ProductServiceApplication.java
+  PURPOSE : Spring Boot entry point for product-service.
+
+product-service/src/main/java/.../model/Product.java
+  PURPOSE : JPA entity representing a product record.
+  WHAT IT DOES :
+    - Maps to the "products" table in the productdb PostgreSQL database.
+    - Fields: id (auto PK), name (not null), description (TEXT),
+      price (BigDecimal, precision 10 scale 2, min 0),
+      stock (Integer, min 0, default 0), createdAt (set on insert).
+    - Bean Validation constraints (@NotBlank, @DecimalMin, @Min) are
+      enforced when the controller receives a POST/PUT request body.
+
+product-service/src/main/java/.../repository/ProductRepository.java
+  PURPOSE : Spring Data JPA repository for Product entities.
+  WHAT IT DOES :
+    - Inherits standard CRUD from JpaRepository<Product, Long>.
+    - Adds findByNameContainingIgnoreCase for a case-insensitive name
+      search (available for future search endpoint use).
+
+product-service/src/main/java/.../service/ProductService.java
+  PURPOSE : Business logic layer for product operations.
+  WHAT IT DOES :
+    - Same transactional and logging pattern as UserService.
+    - update() copies name, description, price, stock from the incoming
+      DTO to the existing managed entity.
+
+product-service/src/main/java/.../controller/ProductController.java
+  PURPOSE : REST API controller exposing Product CRUD endpoints.
+  WHAT IT DOES :
+    - Maps to base path /api/products.
+    - GET /api/products         → all products (ROLE_USER or ROLE_ADMIN)
+    - GET /api/products/{id}    → one product  (ROLE_USER or ROLE_ADMIN)
+    - POST /api/products        → create       (ROLE_ADMIN only)
+    - PUT /api/products/{id}    → update       (ROLE_ADMIN only)
+    - DELETE /api/products/{id} → delete       (ROLE_ADMIN only)
+
+product-service/src/main/java/.../config/SecurityConfig.java
+  PURPOSE : Web security config for product-service.
+  WHAT IT DOES :
+    - Identical in logic to user-service SecurityConfig.
+    - Validates JWTs independently from the gateway (defense in depth).
+    - Maps "roles" JWT claim to Spring Security GrantedAuthority.
+    - SessionCreationPolicy.IF_REQUIRED + NullSecurityContextRepository:
+      same configuration as user-service — sessions may exist for
+      developer data but Spring Security never stores or reads the
+      SecurityContext from them; JWT is re-validated on every request.
+      See the CONCEPT block in the user-service section for full detail.
+
+product-service/src/main/java/.../config/ExceptionHandler.java
+  PURPOSE : Global exception handler for product-service.
+  WHAT IT DOES :
+    - Same pattern as user-service ExceptionHandler.
+    - Returns 404 JSON for missing product lookups.
+
+product-service/Dockerfile
+  PURPOSE : Multi-stage Docker build for product-service.
+  WHAT IT DOES :
+    - Same two-stage Maven → JRE pattern. Exposes port 8082.
+
+
+=====================================================================
+  ORDER-SERVICE  (Microservice 3 — Order Fulfillment)
+=====================================================================
+
+  A Spring Boot REST microservice that orchestrates order creation by
+  communicating with user-service and product-service. It verifies
+  the user exists, checks product stock, decrements stock, and
+  persists the order — all in a single request. Inter-service calls
+  use the OAuth2 client_credentials grant (machine-to-machine auth):
+  order-service authenticates as itself to Keycloak and attaches its
+  own JWT to outbound calls. It also validates the end-user JWT on
+  inbound calls (defense in depth, same as all other microservices).
+
+order-service/pom.xml
+  PURPOSE : Maven build descriptor for order-service.
+  WHAT IT DOES :
+    - Declares spring-boot-starter-web: embedded Tomcat HTTP server.
+    - Declares spring-boot-starter-data-jpa + postgresql: ORM layer.
+    - Declares spring-boot-starter-oauth2-resource-server: validates
+      inbound user JWTs from the API Gateway (defense in depth).
+    - Declares spring-boot-starter-oauth2-client: allows order-service
+      to request its own JWT from Keycloak via client_credentials grant
+      for outbound calls to user-service and product-service.
+    - Declares spring-webflux + reactor-netty-http: provides WebClient
+      for reactive outbound HTTP calls without switching the server mode
+      to Netty (the server remains Servlet/Tomcat).
+    - Same observability stack as other microservices: actuator,
+      micrometer-registry-prometheus, micrometer-tracing-bridge-otel,
+      opentelemetry-exporter-otlp, loki-logback-appender 1.5.1.
+    - Declares spring-cloud-starter-config: fetches config from the
+      centralized Config Server at startup.
+    - Declares spring-boot-starter-validation + lombok.
+
+order-service/src/main/resources/application.yml
+  PURPOSE : Runtime configuration for order-service.
+  WHAT IT DOES :
+    - Binds to port 8083.
+    - Sets spring.main.web-application-type: servlet to prevent the
+      spring-webflux dependency from switching the server to Netty.
+      WebClient is used only as an outbound HTTP client here; the
+      inbound server remains a Servlet/Tomcat stack.
+    - Imports shared config from the Config Server.
+    - Sets the PostgreSQL JDBC URL pointing to postgres-order:5432/orderdb.
+    - Configures the Keycloak JWT issuer URI for inbound token validation.
+    - Configures the OAuth2 client registration named "keycloak":
+        * grant-type: client_credentials
+        * client-id: order-service-client (overridden by ORDER_SERVICE_CLIENT_ID env var)
+        * client-secret: from ORDER_SERVICE_CLIENT_SECRET env var
+    - Configures the OAuth2 provider "keycloak" with the token URI
+      so Spring Security knows where to exchange the client secret for
+      a JWT (KEYCLOAK_TOKEN_URI env var).
+    - Sets services.user-service.url and services.product-service.url
+      to allow OrderService to know where to call those services.
+
+order-service/src/main/resources/logback-spring.xml
+  PURPOSE : Custom Logback configuration identical in structure to other services.
+  WHAT IT DOES :
+    - Ships logs to Loki labeled with app=order-service.
+    - Injects traceId/spanId into every log line for trace correlation.
+
+order-service/src/main/java/.../OrderServiceApplication.java
+  PURPOSE : Spring Boot entry point for order-service.
+  WHAT IT DOES :
+    - Standard @SpringBootApplication bootstrapper.
+
+order-service/src/main/java/.../model/OrderStatus.java
+  PURPOSE : Enum representing the outcome of an order creation attempt.
+  WHAT IT DOES :
+    - CONFIRMED: user and product were valid, stock was decremented,
+      and the order was saved successfully.
+    - FAILED: order could not be completed (insufficient stock, user or
+      product not found). The enum value is stored in the orders table
+      as a string via @Enumerated(EnumType.STRING).
+
+order-service/src/main/java/.../model/Order.java
+  PURPOSE : JPA entity representing a single order record.
+  WHAT IT DOES :
+    - Maps to the "orders" table in the orderdb PostgreSQL database.
+    - Fields: id (auto PK), userId (Long), productId (Long),
+      quantity (Integer), totalPrice (BigDecimal, precision 12 scale 2),
+      status (OrderStatus, stored as STRING), createdAt (Instant).
+    - @PrePersist sets createdAt to the current instant and defaults
+      status to CONFIRMED when null, so callers never set these manually.
+
+order-service/src/main/java/.../dto/CreateOrderRequest.java
+  PURPOSE : Request body DTO for POST /api/orders.
+  WHAT IT DOES :
+    - Fields: userId (@NotNull Long), productId (@NotNull Long),
+      quantity (@NotNull @Min(1) Integer).
+    - @Valid on the controller parameter triggers Bean Validation;
+      invalid input returns 400 before reaching service logic.
+
+order-service/src/main/java/.../dto/UserDto.java
+  PURPOSE : Projection of the user-service User response.
+  WHAT IT DOES :
+    - Fields: id, username, email, firstName, lastName.
+    - Used to deserialise the JSON response from UserServiceClient.
+      Only the fields needed by order-service are declared here;
+      unknown fields from the actual user-service response are ignored.
+
+order-service/src/main/java/.../dto/ProductDto.java
+  PURPOSE : Projection of the product-service Product response.
+  WHAT IT DOES :
+    - Fields: id, name, description, price (BigDecimal), stock (Integer).
+    - Used by ProductServiceClient for both GET and PUT responses.
+      The stock field is used to validate availability before creating
+      an order and to calculate totalPrice = price × quantity.
+
+order-service/src/main/java/.../exception/InsufficientStockException.java
+  PURPOSE : Domain exception signalling that a product has too little stock.
+  WHAT IT DOES :
+    - Extends RuntimeException; carries a descriptive message (e.g.
+      "Insufficient stock for product 5: requested 3, available 1").
+    - Caught by GlobalExceptionHandler and returned to the client as
+      HTTP 409 Conflict so the caller knows the order could not be
+      fulfilled without a server error.
+
+order-service/src/main/java/.../repository/OrderRepository.java
+  PURPOSE : Spring Data JPA repository for Order entities.
+  WHAT IT DOES :
+    - Extends JpaRepository<Order, Long> for standard CRUD.
+    - Custom methods:
+        findByUserId(Long userId)    → all orders belonging to a user
+        findByProductId(Long id)     → all orders for a product
+        findByStatus(OrderStatus s)  → filter by CONFIRMED / FAILED
+
+order-service/src/main/java/.../client/ServiceTokenProvider.java
+  PURPOSE : Obtains a client_credentials JWT from Keycloak for use in
+            outbound calls to other microservices.
+  WHAT IT DOES :
+    - Wraps an OAuth2AuthorizedClientManager (specifically
+      AuthorizedClientServiceOAuth2AuthorizedClientManager).
+    - On each call to getAccessToken(), builds an OAuth2AuthorizeRequest
+      for the "keycloak" client registration using a fixed principal
+      name ("order-service") and calls manager.authorize().
+    - The manager retrieves a cached valid token or transparently
+      exchanges the client_id/secret for a new JWT when the cached
+      token is expired. The token comes from Keycloak's token endpoint
+      using the client_credentials grant.
+    - Returns the raw access token string, which callers include as
+      "Authorization: Bearer <token>" in outbound WebClient calls.
+    - Why AuthorizedClientServiceOAuth2AuthorizedClientManager instead
+      of DefaultOAuth2AuthorizedClientManager? The default manager
+      requires an active HttpServletRequest to be in scope (it stores
+      tokens in the request/response attributes). Service-to-service
+      calls may originate from @Scheduled tasks or other non-request
+      contexts, so AuthorizedClientServiceOAuth2AuthorizedClientManager
+      is used instead — it stores tokens in an OAuth2AuthorizedClientService
+      (in-memory by default), which is independent of any HTTP request.
+
+order-service/src/main/java/.../client/UserServiceClient.java
+  PURPOSE : HTTP client for calling user-service to verify user existence.
+  WHAT IT DOES :
+    - Built from the WebClient bean injected by WebClientConfig.
+    - getUserById(Long userId):
+        1. Calls ServiceTokenProvider.getAccessToken() to obtain a
+           client_credentials JWT.
+        2. Sends GET /api/users/{userId} to the user-service base URL
+           (read from services.user-service.url config property).
+        3. Sets Authorization: Bearer <token> on the request.
+        4. On HTTP 404 from user-service, throws NoSuchElementException
+           so the order controller returns 404 to the API caller.
+        5. Returns a UserDto deserialized from the JSON response.
+
+order-service/src/main/java/.../client/ProductServiceClient.java
+  PURPOSE : HTTP client for calling product-service to read and update products.
+  WHAT IT DOES :
+    - Same WebClient + ServiceTokenProvider pattern as UserServiceClient.
+    - getProductById(Long productId):
+        Sends GET /api/products/{productId}; throws NoSuchElementException
+        on 404; returns ProductDto.
+    - updateProduct(Long productId, ProductDto product):
+        Sends PUT /api/products/{productId} with the modified ProductDto body.
+        Called after decrementing the stock field to persist the new stock
+        level in product-service's database.
+        Returns the updated ProductDto from the response body.
+
+order-service/src/main/java/.../service/OrderService.java
+  PURPOSE : Business logic orchestrating the order fulfilment flow.
+  WHAT IT DOES :
+    createOrder(CreateOrderRequest req):
+      1. Calls UserServiceClient.getUserById() — throws 404 if absent.
+      2. Calls ProductServiceClient.getProductById() — throws 404 if absent.
+      3. Compares req.quantity against product.stock. Throws
+         InsufficientStockException (→ 409) if stock is too low.
+      4. Decrements product.stock by req.quantity and calls
+         ProductServiceClient.updateProduct() to persist the new stock.
+      5. Builds an Order entity: totalPrice = product.price × quantity,
+         status = CONFIRMED.
+      6. Saves and returns the Order via OrderRepository.save().
+    Note: steps 4 and 6 are NOT in a distributed transaction. If the
+    order save fails after the stock has been decremented, stock and
+    order data will be inconsistent. A Saga pattern or outbox table
+    would be needed to make this production-grade.
+
+    findAll()         → delegates to repository.findAll()
+    findById(id)      → repository.findById(), throws NoSuchElementException if absent
+    findByUserId(uid) → repository.findByUserId()
+
+order-service/src/main/java/.../controller/OrderController.java
+  PURPOSE : REST API controller exposing Order endpoints.
+  WHAT IT DOES :
+    - Maps to base path /api/orders.
+    - POST /api/orders            → create order  (ROLE_USER or ROLE_ADMIN)
+      Returns HTTP 201 Created with the saved Order body.
+    - GET /api/orders             → all orders    (ROLE_USER or ROLE_ADMIN)
+    - GET /api/orders/{id}        → one order     (ROLE_USER or ROLE_ADMIN)
+    - GET /api/orders/user/{uid}  → user's orders (ROLE_USER or ROLE_ADMIN)
+    - @PreAuthorize("hasAnyRole('USER','ADMIN')") on all endpoints —
+      order data is user-visible, so ROLE_USER is sufficient.
+    - @Valid on the POST body triggers Bean Validation of CreateOrderRequest.
+
+order-service/src/main/java/.../config/SecurityConfig.java
+  PURPOSE : Web security configuration for order-service.
+  WHAT IT DOES :
+    - Same structure as user-service and product-service SecurityConfig.
+    - Validates inbound JWTs from the API Gateway (defense in depth).
+    - SessionCreationPolicy.IF_REQUIRED + NullSecurityContextRepository —
+      same two-setting combination as other microservices; see the CONCEPT
+      block in the user-service section for the full explanation.
+    - JWT roles converter reads the "roles" claim and maps to Spring
+      Security GrantedAuthority, enabling @PreAuthorize on controllers.
+    - Permits /actuator/** without a token.
+
+order-service/src/main/java/.../config/WebClientConfig.java
+  PURPOSE : Spring configuration that creates the shared WebClient bean and
+            the OAuth2 token manager used for service-to-service calls.
+  WHAT IT DOES :
+    - Declares a ClientRegistrationRepository bean (populated by Spring from
+      application.yml oauth2.client.registration.*).
+    - Declares an OAuth2AuthorizedClientService bean (in-memory store for
+      cached tokens).
+    - Declares an AuthorizedClientServiceOAuth2AuthorizedClientManager bean
+      that combines the two above. This manager handles the client_credentials
+      grant: it fetches a new token when none is cached or the cached token
+      has expired, and returns the cached token otherwise.
+    - Declares a WebClient bean (base instance with no default base URL).
+      UserServiceClient and ProductServiceClient each set their own base URL
+      from injected config properties.
+
+---------------------------------------------------------------------
+  CONCEPT: OAuth2 client_credentials — service-to-service auth
+---------------------------------------------------------------------
+
+  THE FLOW :
+    order-service acts as both a Resource Server (validates inbound JWTs
+    from the API Gateway on behalf of the user) and an OAuth2 Client
+    (obtains its own JWT from Keycloak to call other services).
+
+    The sequence for a POST /api/orders request:
+
+      Browser → API Gateway (validates user JWT, forwards)
+             → OrderController (validates same user JWT again — defense in depth)
+             → OrderService.createOrder()
+             → ServiceTokenProvider.getAccessToken()
+                   order-service client_id + secret → Keycloak token endpoint
+                   Keycloak returns a JWT for the service account
+                   "service-account-order-service-client"
+             → UserServiceClient.getUserById()
+                   GET /api/users/{id} + Authorization: Bearer <service-JWT>
+             → user-service validates the service JWT (it's a valid Keycloak JWT
+                   with the correct issuer and audience)
+             → user-service checks @PreAuthorize: the service account must have
+                   ROLE_USER or ROLE_ADMIN in its JWT "roles" claim
+             → same flow for ProductServiceClient.getProductById() and
+                   ProductServiceClient.updateProduct()
+
+  WHY client_credentials AND NOT TokenRelay :
+    The API Gateway's TokenRelay= filter forwards the end-user's JWT to
+    downstream services. order-service receives that user JWT correctly.
+    But order-service itself cannot forward the user's JWT onwards to
+    user-service and product-service because:
+      1. The user JWT might expire by the time the downstream call fires.
+      2. Caller identity changes: outbound calls are server-to-server,
+         not user-to-server. The service should identify itself, not
+         impersonate the user.
+    client_credentials solves both: order-service always has a fresh
+    service-scoped token independent of any user session.
+
+  KEYCLOAK SETUP FOR client_credentials :
+    order-service-client in the Keycloak realm must have:
+      - serviceAccountsEnabled: true  (creates the service account user
+        "service-account-order-service-client" in the realm)
+      - standardFlowEnabled: false    (no browser login for this client)
+      - A protocol mapper of type oidc-usermodel-realm-role-mapper with
+        claim.name = "roles". Without this mapper the service account's
+        realm roles (ROLE_USER, ROLE_ADMIN) would not appear in the JWT
+        "roles" claim and user-service / product-service would reject the
+        token with 403 Forbidden.
+    The service account user must have ROLE_USER and ROLE_ADMIN assigned
+    as realm roles so downstream services accept the token.
+
+  TOKEN CACHING IN AuthorizedClientServiceOAuth2AuthorizedClientManager :
+    Spring Security caches the OAuth2 token in the OAuth2AuthorizedClientService
+    keyed on (clientRegistrationId, principalName). The manager checks
+    whether the cached token is still valid before fetching a new one.
+    Expired tokens are transparently refreshed. This means Keycloak's
+    token endpoint is called only on first use or after expiry, not on
+    every outbound request.
+
+order-service/src/main/java/.../config/GlobalExceptionHandler.java
+  PURPOSE : Global exception handler converting domain exceptions to HTTP responses.
+  WHAT IT DOES :
+    - @RestControllerAdvice intercepts all controller exceptions.
+    - NoSuchElementException       → 404 Not Found (user or product not found)
+    - InsufficientStockException   → 409 Conflict (stock too low to fulfil order)
+    - WebClientResponseException   → same HTTP status as the upstream error,
+      with a body describing which downstream service failed. This surfaces
+      upstream errors (e.g. user-service returning 500) as a structured error
+      response to the original caller rather than a raw 500 with a stack trace.
+
+order-service/Dockerfile
+  PURPOSE : Multi-stage Docker build for order-service.
+  WHAT IT DOES :
+    - Same two-stage Maven → JRE-alpine pattern as other services.
+    - Exposes port 8083.
+
+config-repo/order-service.yml
+  PURPOSE : Centralized config for order-service fetched from the Config Server.
+  WHAT IT DOES :
+    - Sets spring.datasource.driver-class-name: org.postgresql.Driver.
+    - Sets spring.jpa.database-platform: PostgreSQLDialect.
+    - Enables DEBUG logging for the com.myapp.orderservice package.
+    - Loaded by the Config Server because the file name matches the
+      service's spring.application.name value ("order-service").
+
+
+=====================================================================
+  INFRASTRUCTURE
+=====================================================================
+
+  The infrastructure/ directory contains configuration files for all
+  third-party services (Keycloak, OTel Collector, Prometheus, Loki,
+  Tempo, Grafana). These files are mounted as volumes into the respective
+  containers at runtime — no custom Docker images needed for these services.
+
+---------------------------------------------------------------------
+  infrastructure/keycloak/
+---------------------------------------------------------------------
+
+infrastructure/keycloak/realm-export.json
+  PURPOSE : Declarative Keycloak realm definition that is auto-imported
+            when Keycloak starts in production mode with --import-realm.
+  WHAT IT DOES :
+    - Defines realm name "myapp-realm" with SSO session timeouts and
+      brute-force protection enabled.
+    - Creates two realm roles: ROLE_USER and ROLE_ADMIN.
+    - Creates the "angular-client" OAuth2 client:
+        * Public client (no secret) — correct for browser-based SPAs.
+        * Standard Authorization Code flow with PKCE (S256).
+        * Valid redirect URI: http://localhost:4200/* (the Angular app).
+        * Web origin: http://localhost:4200 (for CORS during token requests).
+        * Protocol mapper that injects realm roles into the JWT as the
+          "roles" array claim — this is what Spring Security reads.
+    - Creates the "api-gateway" client as bearer-only (used for
+      server-side token validation, no interactive login).
+    - Creates two test users with hashed passwords:
+        * user1 / User@1234! with ROLE_USER
+        * admin1 / Admin@1234! with ROLE_USER + ROLE_ADMIN
+    - Pre-configures default client scopes to include "roles".
+    - This file eliminates all manual Keycloak setup — the realm is
+      fully configured on first container start.
+
+---------------------------------------------------------------------
+  infrastructure/otel/
+---------------------------------------------------------------------
+
+infrastructure/otel/otel-collector-config.yaml
+  PURPOSE : OpenTelemetry Collector pipeline configuration.
+  WHAT IT DOES :
+    - Defines receivers:
+        OTLP gRPC on port 4317 — Spring Boot services send traces and
+        metrics here using opentelemetry-exporter-otlp.
+        OTLP HTTP on port 4318 — alternative HTTP transport.
+    - Defines processors:
+        batch — groups telemetry data into batches before export
+        (reduces network calls and improves throughput).
+        resource — adds a service.environment=local label to all signals.
+    - Defines exporters:
+        otlp/tempo — forwards traces to Tempo's gRPC receiver.
+        prometheusremotewrite — pushes metrics to Prometheus's remote
+        write endpoint.
+        otlphttp/loki — pushes logs to Loki 3.0's native OTLP endpoint
+        (http://loki:3100/otlp). NOTE: the older "loki" exporter was
+        removed from the OpenTelemetry Collector contrib distribution;
+        Loki 3.0 accepts logs directly via OTLP at /otlp.
+        debug — prints a summary to the collector's stdout for debugging.
+    - Defines three pipelines:
+        traces  → otlp receiver → batch → tempo
+        metrics → otlp receiver → batch → prometheus
+        logs    → otlp receiver → batch → otlphttp/loki
+
+---------------------------------------------------------------------
+  infrastructure/prometheus/
+---------------------------------------------------------------------
+
+infrastructure/prometheus/prometheus.yml
+  PURPOSE : Prometheus scrape configuration.
+  WHAT IT DOES :
+    - Sets global scrape interval to 15s.
+    - Defines scrape jobs for each Spring Boot service, targeting
+      their /actuator/prometheus endpoint where Micrometer exposes
+      JVM, HTTP request, and custom metrics in Prometheus text format.
+    - Also scrapes Keycloak's /metrics endpoint for auth server metrics.
+    - Also scrapes the OTel Collector's built-in metrics endpoint.
+    - Prometheus pulls (scrapes) from these targets on its interval and
+      stores the time-series data in its local TSDB, from which Grafana
+      reads for dashboard visualisation.
+
+---------------------------------------------------------------------
+  infrastructure/loki/
+---------------------------------------------------------------------
+
+infrastructure/loki/loki-config.yaml
+  PURPOSE : Configuration for the Grafana Loki log aggregation server.
+  WHAT IT DOES :
+    - Disables multi-tenancy (auth_enabled: false) — suitable for
+      single-tenant local/dev setups.
+    - Configures the HTTP listener on port 3100.
+    - Uses the filesystem backend for both chunk storage and index
+      (data persisted to the loki Docker volume).
+    - Sets schema v13 (tsdb) — the current recommended Loki schema.
+    - Enables structured metadata (needed for OTel log attributes).
+    - Enables the embedded query cache to speed up repeated queries.
+    - Rejects log entries older than 168h (7 days) to prevent accidental
+      bulk ingestion of historical data.
+
+---------------------------------------------------------------------
+  infrastructure/tempo/
+---------------------------------------------------------------------
+
+infrastructure/tempo/tempo.yaml
+  PURPOSE : Configuration for the Grafana Tempo distributed tracing backend.
+  WHAT IT DOES :
+    - Binds the HTTP API to port 3100 (exposed as 3110 on the host to
+      avoid conflict with Loki's 3100).
+    - Enables OTLP receivers (gRPC and HTTP) so the OTel Collector can
+      forward traces to Tempo.
+    - Configures local filesystem storage for trace data and WAL
+      (Write-Ahead Log for durability).
+    - Configures the metrics generator:
+        * Generates service graph metrics (request rates, error rates,
+          latencies between services) and span metrics from trace data.
+        * Remote-writes these derived metrics to Prometheus, enabling
+          the "Service Map" view in Grafana.
+    - Sets block retention to 48h (traces older than 2 days are deleted).
+
+---------------------------------------------------------------------
+  infrastructure/grafana/provisioning/
+---------------------------------------------------------------------
+
+infrastructure/grafana/provisioning/datasources/datasources.yaml
+  PURPOSE : Grafana datasource provisioning — auto-configures all
+            data sources when Grafana starts, with no manual UI setup.
+  WHAT IT DOES :
+    - Provisions Prometheus as the default datasource (for metrics).
+    - Provisions Loki (for logs), with a derived field configuration
+      that detects traceId values in log lines and creates clickable
+      links to the corresponding Tempo trace — enabling one-click
+      navigation from a log entry to its distributed trace.
+    - Provisions Tempo (for traces) with:
+        * Trace-to-logs linkage pointing to Loki (so clicking a trace
+          span shows the logs from that time window).
+        * Trace-to-metrics linkage pointing to Prometheus.
+        * Service map enabled (uses the metrics Tempo generates in Prometheus).
+        * Node graph enabled for visualising service topology.
+
+infrastructure/grafana/provisioning/dashboards/dashboards.yaml
+  PURPOSE : Tells Grafana where to find dashboard JSON files to import.
+  WHAT IT DOES :
+    - Instructs Grafana to scan /etc/grafana/provisioning/dashboards
+      for JSON dashboard definitions and import them into the "MyApp"
+      folder automatically on startup.
+    - Any dashboard JSON file placed in infrastructure/grafana/provisioning/
+      dashboards/ will be available in Grafana without manual import.
+
+
+=====================================================================
+  FRONTEND  (Angular 17 SPA)
+=====================================================================
+
+  A single-page Angular application that serves as the user interface
+  for the system. It integrates with Keycloak for authentication,
+  communicates with the backend exclusively through the API Gateway,
+  and is served by nginx in production (Docker).
+
+---------------------------------------------------------------------
+  Build & Configuration Files
+---------------------------------------------------------------------
+
+frontend/package.json
+  PURPOSE : npm project manifest declaring all dependencies and scripts.
+  WHAT IT DOES :
+    - Lists Angular 17.3.x core packages as dependencies.
+    - Lists keycloak-angular 16 and keycloak-js 24 for Keycloak integration.
+    - Lists Angular CLI and build tooling as devDependencies.
+    - Defines npm scripts: start (ng serve for local dev),
+      build (ng build for production), test (karma unit tests).
+
+frontend/angular.json
+  PURPOSE : Angular CLI workspace configuration.
+  WHAT IT DOES :
+    - Defines the "frontend" project with sourceRoot=src.
+    - Configures the build architect using @angular-devkit/build-angular.
+    - Sets the output path (dist/frontend), entry point (main.ts),
+      global stylesheet (styles.css), and asset directory.
+    - Defines production build configuration with a fileReplacements rule
+      that swaps environment.ts → environment.prod.ts so the Keycloak URL
+      is environment-specific without maintaining separate builds.
+    - Defines k8s build configuration with a fileReplacements rule that
+      swaps environment.ts → environment.k8s.ts for Kubernetes deployments
+      where Keycloak is accessed via the keycloak.local Ingress hostname.
+    - Defines development build configuration with source maps and no
+      optimisation.
+    - Configures the dev server to use proxy.conf.json (so /api requests
+      are forwarded to the API Gateway during local development without CORS).
+
+frontend/tsconfig.json
+  PURPOSE : TypeScript compiler base configuration.
+  WHAT IT DOES :
+    - Targets ES2022 with strict mode enabled (catches more type errors).
+    - Sets moduleResolution to "bundler" (optimised for Angular's esbuild).
+    - Enables experimentalDecorators for Angular's @Component, @Injectable, etc.
+    - Enables strict Angular template checking (strictTemplates).
+
+frontend/tsconfig.app.json
+  PURPOSE : TypeScript config specific to the application build (extends base).
+  WHAT IT DOES :
+    - Sets the application entry point to src/main.ts.
+    - Excludes test type definitions from the application compilation.
+
+frontend/proxy.conf.json
+  PURPOSE : Angular dev-server proxy configuration for local development.
+  WHAT IT DOES :
+    - Intercepts any request starting with /api made by the local dev
+      server (ng serve on port 4200) and forwards it to the API Gateway
+      at http://localhost:8090.
+    - Eliminates CORS issues during development without changing the
+      backend CORS configuration.
+    - This file is only used during local development; in Docker, nginx
+      handles the same proxying via nginx.conf.
+
+frontend/nginx.conf
+  PURPOSE : nginx web server configuration for the production Docker container.
+  WHAT IT DOES :
+    - Serves static Angular build output from /usr/share/nginx/html.
+    - Implements the SPA fallback: any URL that doesn't match a file
+      serves index.html, allowing Angular's client-side router to handle
+      routes like /dashboard, /users, /admin.
+    - Proxies /api/ requests to the api-gateway container by name
+      (http://api-gateway:8090), so the browser never talks directly to
+      the gateway (same-origin from the browser's perspective).
+    - Uses proxy_http_version 1.1 and proxy_set_header Connection ""
+      for the /api/ proxy block, enabling proper HTTP/1.1 keep-alive
+      connections to Spring Cloud Gateway's reactive Netty server. Without
+      this, nginx defaults to HTTP/1.0 which can cause 502 errors with
+      reactive backends.
+    - Explicitly forwards the Authorization header via proxy_set_header
+      so the Bearer JWT token is always passed to the API Gateway.
+    - Enables gzip compression for text assets.
+    - Sets 1-year cache headers with immutable for hashed static assets
+      (JS, CSS files Angular names with content hashes on production build).
+
+frontend/Dockerfile
+  PURPOSE : Multi-stage Docker build for the Angular SPA.
+  WHAT IT DOES :
+    - Stage 1 (build): Uses node:20-alpine, installs npm dependencies with
+      --legacy-peer-deps (handles peer dependency version differences
+      between keycloak-angular and Angular 17), then runs ng build --
+      configuration production to produce optimised, minified, tree-shaken
+      output in dist/frontend/browser.
+    - Stage 2 (serve): Uses nginx:alpine, copies only the build output
+      (no Node.js or source code) and the custom nginx.conf.
+    - Result: a tiny production image (~25MB) with no build tooling.
+
+---------------------------------------------------------------------
+  src/ — Application Source
+---------------------------------------------------------------------
+
+frontend/src/index.html
+  PURPOSE : The single HTML file that bootstraps the Angular app.
+  WHAT IT DOES :
+    - Contains <app-root> where Angular mounts the AppComponent.
+    - Sets <base href="/"> so Angular's router resolves URLs from root.
+    - Angular's build process injects all compiled JS and CSS bundle
+      <script>/<link> tags into this file automatically.
+
+frontend/src/styles.css
+  PURPOSE : Global stylesheet applied to the entire application.
+  WHAT IT DOES :
+    - Resets box-sizing, margin, padding for consistency across browsers.
+    - Defines reusable utility classes: .page, .card, .btn, .badge,
+      .modal-overlay, .modal, .form-group, .flex, .alert, .text-muted, etc.
+    - All page components use these shared classes instead of duplicating
+      CSS, keeping component stylesheets minimal.
+
+frontend/src/environments/environment.ts
+  PURPOSE : Development-time environment variables for the Angular build.
+  WHAT IT DOES :
+    - Exports { production: false, keycloakUrl: 'http://localhost:8080' }.
+    - Used when running ng serve or building without --configuration production.
+    - Points to the locally exposed Keycloak Docker Compose port.
+
+frontend/src/environments/environment.prod.ts
+  PURPOSE : Production environment variables swapped in during the
+            production build via angular.json fileReplacements.
+  WHAT IT DOES :
+    - Exports { production: true, keycloakUrl: 'http://localhost:8080' }.
+    - Used when building with ng build --configuration production
+      (the default in the Dockerfile), which targets Docker Compose.
+    - Points to the host-exposed Keycloak port so the browser can reach
+      Keycloak at the same URL it uses directly (localhost:8080).
+
+frontend/src/environments/environment.k8s.ts
+  PURPOSE : Kubernetes-specific environment variables for the k8s build.
+  WHAT IT DOES :
+    - Exports { production: true, keycloakUrl: 'http://keycloak.local' }.
+    - Used when building with ng build --configuration k8s.
+    - Points to the Keycloak Ingress hostname used in Kubernetes so the
+      browser can reach Keycloak without knowing any internal IP or port.
+    - Build the K8s image with: ng build --configuration k8s (or update
+      the Dockerfile to use --configuration k8s instead of production).
+
+frontend/src/main.ts
+  PURPOSE : Angular application bootstrap entry point.
+  WHAT IT DOES :
+    - Calls bootstrapApplication(AppComponent) with the standalone
+      component API (Angular 17 style, no NgModule).
+    - Provides provideHttpClient with the authInterceptor function so
+      every HTTP request automatically gets the Authorization header.
+    - Provides provideRouter with the route table defined in app.routes.ts.
+    - Imports KeycloakAngularModule and registers an APP_INITIALIZER that
+      calls keycloak.init() before Angular renders any component.
+    - Reads environment.keycloakUrl for the Keycloak server URL so the
+      same build artefact does not need to be rebuilt for each environment
+      (the production build already has the correct URL baked in via
+      environment.prod.ts).
+    - The Keycloak init uses onLoad: 'check-sso' (silently checks if the
+      user is already logged in without forcing a redirect) and points to
+      the silent-check-sso.html page for iframe-based session detection.
+
+frontend/src/assets/silent-check-sso.html
+  PURPOSE : Helper page for Keycloak's silent SSO check.
+  WHAT IT DOES :
+    - Keycloak loads this page in a hidden iframe to check if the user
+      has an active SSO session on the Keycloak server without causing
+      a visible page redirect.
+    - The single script posts the URL back to the parent window, which
+      Keycloak's JS library reads to determine login state.
+
+---------------------------------------------------------------------
+  src/app/ — Core Application
+---------------------------------------------------------------------
+
+frontend/src/app/app.component.ts
+  PURPOSE : Root component — the application shell.
+  WHAT IT DOES :
+    - Renders the NavbarComponent at the top of every page.
+    - Renders <router-outlet> where Angular swaps in page components
+      based on the current URL route.
+    - Standalone component (no NgModule needed).
+
+frontend/src/app/app.routes.ts
+  PURPOSE : Client-side route table defining all application pages.
+  WHAT IT DOES :
+    - / redirects to /dashboard.
+    - /dashboard loads DashboardComponent, guarded by authGuard (any
+      authenticated user).
+    - /users loads UsersComponent, guarded by authGuard with ROLE_USER
+      required.
+    - /products loads ProductsComponent, guarded by authGuard with
+      ROLE_USER required.
+    - /admin loads AdminComponent, guarded by authGuard with ROLE_ADMIN
+      required (only admin1 can access this page).
+    - All page components are lazy-loaded (loadComponent) so the initial
+      bundle only includes the dashboard code.
+    - ** wildcard redirects unknown URLs back to /dashboard.
+
+frontend/src/app/interceptors/auth.interceptor.ts
+  PURPOSE : HTTP interceptor that attaches the Keycloak JWT to API requests.
+  WHAT IT DOES :
+    - Implements Angular's HttpInterceptorFn (functional interceptor, Angular 15+).
+    - Skips requests that don't start with /api (e.g. Keycloak's own
+      OIDC endpoints must not receive the app's Bearer token).
+    - For /api requests, calls keycloak.getToken() which returns the
+      current access token (and silently refreshes it if expired).
+    - Clones the request and adds Authorization: Bearer <token> header.
+    - Returns the modified request to the HTTP pipeline.
+
+frontend/src/app/guards/auth.guard.ts
+  PURPOSE : Route guard that protects pages requiring authentication and roles.
+  WHAT IT DOES :
+    - CanActivateFn checks if keycloak.isLoggedIn().
+    - If not logged in: calls keycloak.login({ redirectUri }) with a
+      properly formed redirect URI (window.location.origin + '/' +
+      route.url.join('/')) to return the user to the intended page after
+      login; returns false to cancel navigation.
+    - If logged in: reads route.data['roles'] (e.g. ['ROLE_ADMIN']).
+    - If no roles required: returns true (any authenticated user may access).
+    - If roles required: reads the 'roles' array directly from
+      keycloak.getKeycloakInstance().tokenParsed (the custom Keycloak
+      Protocol Mapper puts roles at the top-level 'roles' claim, not in
+      realm_access.roles). Checks each required role against this array;
+      if none match, redirects to /dashboard and returns false.
+    - NOTE: keycloak.isUserInRole() is NOT used for role checks because
+      it reads from realm_access.roles (the default Keycloak location),
+      whereas this project's Protocol Mapper puts roles in a custom top-
+      level 'roles' claim. Reading tokenParsed directly is the correct
+      approach for this project's JWT structure.
+
+frontend/src/app/services/api.service.ts
+  PURPOSE : Centralised HTTP client service for all backend API calls.
+  WHAT IT DOES :
+    - Defines TypeScript interfaces User, Product, Order, and
+      CreateOrderRequest matching the JSON shapes returned by the Spring
+      Boot microservices.
+    - Provides methods: getUsers, getUser, createUser, updateUser,
+      deleteUser, getProducts, getProduct, createProduct, updateProduct,
+      deleteProduct, getOrders, getOrdersByUser, createOrder.
+    - All methods call HttpClient which automatically passes through the
+      authInterceptor, so tokens are attached without any extra code.
+    - Uses relative URLs (/api/users, /api/products, /api/orders) which
+      are proxied to the API Gateway by either proxy.conf.json (dev) or
+      nginx.conf (Docker).
+    - Order interface fields: id, userId, productId, quantity, totalPrice,
+      status ('CONFIRMED' | 'FAILED'), createdAt.
+    - CreateOrderRequest: userId, productId, quantity.
+
+---------------------------------------------------------------------
+  src/app/components/
+---------------------------------------------------------------------
+
+frontend/src/app/components/navbar/navbar.component.ts
+  PURPOSE : Navigation bar shown at the top of every page.
+  WHAT IT DOES :
+    - Displays the app brand name "MyApp".
+    - Shows navigation links: Dashboard, Users, Products, Orders; Admin
+      link is conditionally shown only when isAdmin is true.
+    - Shows the logged-in username and a role badge (Admin/User).
+    - Provides Login button when not authenticated, Logout button when
+      authenticated (calls keycloak.logout() which redirects to Keycloak
+      and then back to the app origin).
+    - Uses RouterLink and RouterLinkActive for navigation with active
+      link highlighting.
+    - Reads username from keycloak.getKeycloakInstance().idTokenParsed
+      ['preferred_username'] (falls back to tokenParsed) rather than
+      keycloak.getUsername(), because getUsername() in keycloak-angular v16
+      requires loadUserProfile() to be called first (extra CORS-restricted
+      HTTP request to Keycloak's account endpoint). Reading idTokenParsed is
+      instant and requires no additional network calls. idTokenParsed is
+      preferred because Keycloak 24 may omit preferred_username from the
+      access token depending on scope configuration.
+    - Checks isAdmin by reading the custom top-level 'roles' claim from
+      tokenParsed and calling .includes('ROLE_ADMIN'). Does NOT use
+      keycloak.isUserInRole(), which reads realm_access.roles and would
+      always return false for this project's Protocol Mapper setup.
+
+---------------------------------------------------------------------
+  src/app/pages/
+---------------------------------------------------------------------
+
+frontend/src/app/pages/dashboard/dashboard.component.ts
+  PURPOSE : Landing page for authenticated users.
+  WHAT IT DOES :
+    - Greets the user by name and displays their roles.
+    - Shows navigation cards to Users, Products, Orders, and
+      (conditionally) Admin pages.
+    - Displays a "Token Info" card showing username, email, and all roles
+      parsed directly from the Keycloak JWT — useful for debugging auth.
+    - Reads username and email from idTokenParsed (falls back to
+      tokenParsed) and roles from tokenParsed['roles'], deduplicating
+      with Set to guard against Protocol Mappers that emit roles from
+      multiple sources. Does NOT call keycloak.loadUserProfile() or
+      keycloak.isUserInRole() — both require extra setup or read from
+      the wrong claim location for this project's Protocol Mapper.
+
+frontend/src/app/pages/users/users.component.ts
+  PURPOSE : User management page.
+  WHAT IT DOES :
+    - Fetches and displays all users in a table via ApiService.getUsers().
+    - Table columns: ID, Username, Email, First Name, Last Name, Created date.
+    - Admin users see an Actions column with Edit and Delete buttons and
+      a "+ New User" button. isAdmin is derived from tokenParsed['roles']
+      (deduplicated via Set), NOT keycloak.isUserInRole().
+    - Edit and Create operations open a modal form with ngModel two-way
+      binding for username, email, firstName, lastName.
+    - Delete prompts for confirmation before calling ApiService.deleteUser().
+    - Displays a loading state and an error message if the API call fails.
+
+frontend/src/app/pages/products/products.component.ts
+  PURPOSE : Product catalog management page.
+  WHAT IT DOES :
+    - Same structure as UsersComponent but for products.
+    - Table columns: ID, Name, Description, Price (formatted as currency),
+      Stock (shown in red if 0), Created date.
+    - Admin users can create, edit, and delete products via a modal form
+      with name, description, price, and stock fields. isAdmin derived
+      from tokenParsed['roles'], NOT keycloak.isUserInRole().
+
+frontend/src/app/pages/orders/orders.component.ts
+  PURPOSE : Order management page — browse existing orders and place new ones.
+  WHAT IT DOES :
+    - isAdmin derived from tokenParsed['roles'] (deduplicated via Set).
+      Username resolved from idTokenParsed['preferred_username'] to avoid
+      calling keycloak.getUsername() which throws if loadUserProfile() has
+      not been called.
+    - Admin role: loads all orders via getOrders(); fetches all users and
+      products to build lookup maps (ID → name) for the table.
+    - Regular user (ROLE_USER): resolves the logged-in user's database ID
+      by matching preferred_username against the /api/users list, then
+      loads only that user's orders via getOrdersByUser(id). Shows an info
+      banner when no matching DB profile is found.
+    - Displays orders in a table with columns: ID, User (admins only),
+      Product, Quantity, Total Price, Status, Created date. Status shown
+      as a green badge (CONFIRMED) or red badge (FAILED).
+    - "+ Place Order" button: enabled for admins regardless of DB profile;
+      enabled for regular users only when their DB profile is resolved.
+    - Place Order modal: refreshes the product list on every open (so
+      newly added products appear immediately). Admins see a User dropdown
+      to select which user the order is placed for; regular users use their
+      own resolved currentUserId.
+    - Submits POST /api/orders via ApiService.createOrder() and refreshes
+      the list on success.
+    - Route: /orders, protected by authGuard with data: { roles: ['ROLE_USER'] }.
+
+frontend/src/app/pages/admin/admin.component.ts
+  PURPOSE : Administrator-only dashboard with system stats and quick links.
+  WHAT IT DOES :
+    - Only reachable by users with ROLE_ADMIN (enforced by authGuard).
+    - Calls getUsers(), getProducts(), and getOrders() in parallel using
+      RxJS forkJoin (catchError wraps each call so a single service outage
+      does not break the whole page).
+    - Displays stat cards: total users, total products, out-of-stock count,
+      total orders.
+    - Provides quick-link buttons to: Keycloak Admin Console, Grafana,
+      Prometheus, Config Server actuator, API Gateway routes actuator,
+      Order Service actuator health.
+    - Lists all backend services with their ports for quick reference,
+      including order-service on :8083.
+
+
+=====================================================================
+  SUMMARY — HOW THE PIECES FIT TOGETHER
+=====================================================================
+
+REQUEST FLOW (happy path):
+  1. User opens http://localhost:4200 in browser.
+  2. Angular starts, Keycloak.init() detects no active session.
+  3. authGuard on /dashboard redirects to Keycloak login page (:8080).
+  4. User logs in; Keycloak issues JWT with "roles" claim.
+  5. Browser is redirected back to Angular with the token.
+  6. User navigates to /products. authGuard checks ROLE_USER in token — OK.
+  7. ProductsComponent calls ApiService.getProducts() → GET /api/products.
+  8. authInterceptor adds Authorization: Bearer <JWT> to the request.
+  9. nginx proxies /api/ to api-gateway:8090.
+  10. API Gateway validates JWT signature (Keycloak JWKS), checks issuer.
+  11. TokenRelay= filter copies the JWT into the forwarded request.
+  12. Request is routed to product-service:8082/api/products.
+  13. product-service validates the JWT again (defense in depth).
+  14. @PreAuthorize("hasAnyRole('USER','ADMIN')") passes.
+  15. ProductService.findAll() queries postgres-product, returns JSON.
+  16. Response flows back: product-service → gateway → nginx → Angular.
+  17. ProductsComponent renders the product table.
+
+ORDER PLACEMENT FLOW (service-to-service):
+  1. User opens /orders, clicks "Place Order", selects product + quantity.
+  2. OrdersComponent calls ApiService.createOrder() → POST /api/orders.
+  3. authInterceptor attaches the user's JWT; nginx proxies to api-gateway.
+  4. API Gateway validates JWT and routes to order-service:8083/api/orders.
+  5. order-service validates the user JWT (defense in depth).
+  6. @PreAuthorize("hasRole('USER')") passes.
+  7. OrderService calls user-service to verify the user exists:
+     - Uses AuthorizedClientServiceOAuth2AuthorizedClientManager to obtain
+       a client_credentials token for order-service-client from Keycloak.
+     - Calls GET http://user-service:8081/api/users/{userId} with Bearer
+       token (service account token, not the user's token).
+  8. OrderService calls product-service to fetch product + check stock:
+     - Same client_credentials token reused (cached by OAuth2AuthorizedClientService).
+     - Calls GET http://product-service:8082/api/products/{productId}.
+  9. If user exists, product exists, and stock >= quantity:
+     - order-service calls PUT /api/products/{id} (admin scope) to decrement stock.
+     - Creates order record in postgres-order with status CONFIRMED.
+  10. If any check fails: order is saved with status FAILED.
+  11. OrderResponse JSON returned to Angular; OrdersComponent refreshes list.
+
+OBSERVABILITY FLOW:
+  - Every Spring Boot service creates a trace span per HTTP request.
+  - Micrometer OTel bridge sends spans via gRPC to otel-collector:4317.
+  - OTel Collector batches and forwards spans to Tempo.
+  - Micrometer exposes /actuator/prometheus; Prometheus scrapes it every 15s.
+  - Loki Logback Appender pushes log batches directly to Loki:3100.
+  - Grafana queries all three backends; Datasource config enables
+    cross-navigation: click a log line → jump to its trace in Tempo.
+
+CONFIGURATION FLOW:
+  - Config Server starts and mounts config-repo/ as a volume.
+  - api-gateway, user-service, product-service, order-service each call
+    Config Server at startup: GET /<service-name>/default → returns merged
+    application.yml + <service-name>.yml properties.
+  - Services use these remote properties alongside their own
+    application.yml (local values override remote values).
+=====================================================================
+
+
+=====================================================================
+  KUBERNETES (k8s/) — DEPLOYMENT FILES
+=====================================================================
+
+  The k8s/ directory contains all Kubernetes manifests to run the
+  same 15-service stack in a Kubernetes cluster instead of Docker
+  Compose. Files are numbered in dependency order and grouped into
+  sub-directories by concern. All resources live in the "myapp"
+  namespace.
+
+  PREREQUISITES:
+    - A running cluster (minikube, kind, k3s, EKS, AKS, GKE, etc.)
+    - kubectl configured to point at the cluster
+    - An nginx Ingress Controller installed
+    - Custom Spring Boot / Angular images built and pushed
+      (or loaded into minikube with: minikube image load myapp/<name>:1.0.0)
+
+  DIRECTORY LAYOUT:
+    k8s/
+    ├── kustomization.yaml          Master apply list (kubectl apply -k k8s/)
+    ├── 00-namespace.yaml
+    ├── 01-secrets.yaml
+    ├── configmaps/
+    │   ├── 02-config-repo-cm.yaml
+    │   ├── 03-infra-configs-cm.yaml
+    │   └── 04-keycloak-realm-cm.yaml
+    ├── storage/
+    │   └── 05-pvcs.yaml
+    ├── databases/
+    │   ├── 06-postgres-keycloak.yaml
+    │   ├── 07-postgres-user.yaml
+    │   ├── 08-postgres-product.yaml
+    │   └── 09-postgres-order.yaml
+    ├── auth/
+    │   └── 09-keycloak.yaml
+    ├── spring-cloud/
+    │   ├── 10-config-server.yaml
+    │   └── 11-api-gateway.yaml
+    ├── microservices/
+    │   ├── 12-user-service.yaml
+    │   ├── 13-product-service.yaml
+    │   └── 14-order-service.yaml
+    ├── observability/
+    │   ├── 14-otel-collector.yaml
+    │   ├── 15-prometheus.yaml
+    │   ├── 16-loki.yaml
+    │   ├── 17-tempo.yaml
+    │   └── 18-grafana.yaml
+    ├── frontend/
+    │   └── 19-frontend.yaml
+    └── 20-ingress.yaml
+
+---------------------------------------------------------------------
+  k8s/kustomization.yaml
+---------------------------------------------------------------------
+
+k8s/kustomization.yaml
+  PURPOSE : Kustomize entry point that lists all manifests in the
+            correct apply order.
+  WHAT IT DOES :
+    - Allows deploying the entire stack with a single command:
+      kubectl apply -k k8s/
+    - Kustomize processes the list top-to-bottom so foundational
+      resources (namespace, secrets, configmaps, PVCs) are registered
+      before the Pods that depend on them.
+    - Sets namespace: myapp as a default so it does not need to be
+      repeated in every individual manifest.
+
+---------------------------------------------------------------------
+  k8s/00-namespace.yaml
+---------------------------------------------------------------------
+
+k8s/00-namespace.yaml
+  PURPOSE : Creates the "myapp" Kubernetes namespace that isolates all
+            project resources from other workloads in the cluster.
+  WHAT IT DOES :
+    - Defines the Namespace object named "myapp".
+    - All subsequent manifests target this namespace.
+    - Applying this first ensures the namespace exists before any
+      resource tries to be created inside it.
+
+---------------------------------------------------------------------
+  k8s/01-secrets.yaml
+---------------------------------------------------------------------
+
+k8s/01-secrets.yaml
+  PURPOSE : Declares all Kubernetes Secrets used by the stack.
+  WHAT IT DOES :
+    - Uses stringData (plaintext) which Kubernetes base64-encodes
+      automatically when storing in etcd.
+    - Creates 8 separate Secret objects, one per concern, following
+      the principle of least privilege (each Pod only mounts the
+      secret it needs):
+        keycloak-db-secret     : KC_DB_PASSWORD
+        keycloak-admin-secret  : KEYCLOAK_ADMIN + KEYCLOAK_ADMIN_PASSWORD
+        user-db-secret         : USER_DB_PASSWORD
+        product-db-secret      : PRODUCT_DB_PASSWORD
+        order-db-secret        : ORDER_DB_PASSWORD
+        order-client-secret    : ORDER_SERVICE_CLIENT_SECRET (Keycloak
+                                  client_credentials secret for order-service)
+        config-server-secret   : CONFIG_SERVER_PASSWORD
+        grafana-secret         : GF_SECURITY_ADMIN_PASSWORD
+    - Pods consume these via secretKeyRef in their env sections so
+      passwords never appear in Deployment specs.
+
+---------------------------------------------------------------------
+  k8s/configmaps/
+---------------------------------------------------------------------
+
+k8s/configmaps/02-config-repo-cm.yaml
+  PURPOSE : Packages the entire config-repo/ directory as a ConfigMap
+            so the config-server Pod can serve it without a volume mount
+            from the host.
+  WHAT IT DOES :
+    - Contains application.yml (shared config for all services),
+      user-service.yml, product-service.yml, and order-service.yml as
+      ConfigMap data keys.
+    - Mounted into the config-server container at /config-repo.
+    - In Docker Compose the host directory is bind-mounted; in K8s this
+      ConfigMap replaces that bind-mount, making the deployment portable.
+    - Updating the ConfigMap and rolling the config-server Pod picks up
+      new shared configuration without rebuilding any image.
+
+k8s/configmaps/03-infra-configs-cm.yaml
+  PURPOSE : Packages all infrastructure tool configuration files as
+            ConfigMaps, one per tool.
+  WHAT IT DOES :
+    - prometheus-config  : prometheus.yml with scrape jobs for all
+      Spring Boot services, Keycloak, and OTel Collector.
+    - otel-collector-config : otel-collector-config.yaml defining OTLP
+      receivers, batch processors, and exporters to Tempo/Prometheus/Loki.
+    - loki-config        : loki-config.yaml with filesystem storage and
+      schema v13.
+    - tempo-config       : tempo.yaml with OTLP receivers, local trace
+      storage, and metrics generation to Prometheus.
+    - grafana-datasources : datasources.yaml auto-provisioning Prometheus,
+      Loki, and Tempo with cross-datasource linking enabled.
+    - nginx-config       : default.conf for the frontend nginx container,
+      proxying /api/ to api-gateway:8090 and SPA fallback for Angular
+      routes. Replaces the nginx.conf bind-mount from Docker Compose.
+
+k8s/configmaps/04-keycloak-realm-cm.yaml
+  PURPOSE : Packages the Keycloak realm JSON as a ConfigMap so Keycloak
+            can auto-import it at startup without a host bind-mount.
+  WHAT IT DOES :
+    - Contains the full realm-export.json as a single ConfigMap key.
+    - Mounted into the Keycloak Pod at /opt/keycloak/data/import.
+    - Keycloak's --import-realm flag reads all JSON files in that
+      directory on first startup and creates the realm, clients, roles,
+      protocol mappers, and test users automatically.
+
+---------------------------------------------------------------------
+  k8s/storage/
+---------------------------------------------------------------------
+
+k8s/storage/05-pvcs.yaml
+  PURPOSE : Declares PersistentVolumeClaims for all stateful services.
+  WHAT IT DOES :
+    - Creates 8 PVCs (ReadWriteOnce, one per stateful service):
+        postgres-keycloak-pvc  2Gi  — Keycloak database
+        postgres-user-pvc      2Gi  — User service database
+        postgres-product-pvc   2Gi  — Product service database
+        postgres-order-pvc     2Gi  — Order service database
+        prometheus-pvc         5Gi  — Prometheus TSDB
+        loki-pvc               5Gi  — Loki log chunks
+        tempo-pvc              5Gi  — Tempo trace blocks
+        grafana-pvc            1Gi  — Grafana dashboard state
+    - ReadWriteOnce means only one node can mount the volume at a time,
+      which is appropriate for single-replica stateful workloads.
+    - The cluster's default StorageClass provisions the underlying
+      PersistentVolume (e.g. hostPath on minikube, EBS on EKS).
+
+---------------------------------------------------------------------
+  k8s/databases/
+---------------------------------------------------------------------
+
+k8s/databases/06-postgres-keycloak.yaml
+  PURPOSE : Deploys the PostgreSQL database used by Keycloak.
+  WHAT IT DOES :
+    - Uses a StatefulSet (not Deployment) because PostgreSQL requires a
+      stable network identity and persistent storage.
+    - serviceName: postgres-keycloak creates a headless Service giving
+      the Pod a stable DNS name: postgres-keycloak.myapp.svc.cluster.local.
+    - Reads KC_DB_PASSWORD from the keycloak-db-secret Secret.
+    - readinessProbe / livenessProbe run pg_isready so Kubernetes knows
+      exactly when the database is ready to accept connections.
+    - Mounts postgres-keycloak-pvc at /var/lib/postgresql/data for
+      durable storage that survives Pod restarts.
+
+k8s/databases/07-postgres-user.yaml
+  PURPOSE : Deploys the dedicated PostgreSQL database for user-service.
+  WHAT IT DOES :
+    - Same StatefulSet pattern as postgres-keycloak.
+    - Database: userdb, user: userservice.
+    - Password from user-db-secret.
+    - Mounted on postgres-user-pvc.
+
+k8s/databases/08-postgres-product.yaml
+  PURPOSE : Deploys the dedicated PostgreSQL database for product-service.
+  WHAT IT DOES :
+    - Same StatefulSet pattern as the other two Postgres instances.
+    - Database: productdb, user: productservice.
+    - Password from product-db-secret.
+    - Mounted on postgres-product-pvc.
+
+k8s/databases/09-postgres-order.yaml
+  PURPOSE : Deploys the dedicated PostgreSQL database for order-service.
+  WHAT IT DOES :
+    - Same StatefulSet pattern as the other Postgres instances.
+    - Database: orderdb, user: orderservice.
+    - Password from order-db-secret.
+    - Mounted on postgres-order-pvc.
+
+---------------------------------------------------------------------
+  k8s/auth/
+---------------------------------------------------------------------
+
+k8s/auth/09-keycloak.yaml
+  PURPOSE : Deploys Keycloak in production mode backed by PostgreSQL.
+  WHAT IT DOES :
+    - initContainer (wait-for-postgres): polls nc -z postgres-keycloak 5432
+      in a loop so the main container never starts until the DB is
+      accepting TCP connections. This replaces the depends_on healthcheck
+      ordering in Docker Compose.
+    - Main container runs quay.io/keycloak/keycloak:24.0.4 with:
+        args: [start, --import-realm]  — production mode + realm import
+        KC_DB_URL = jdbc:postgresql://postgres-keycloak:5432/keycloak
+        KC_HTTP_ENABLED = true (TLS terminated at Ingress)
+        KC_HEALTH_ENABLED / KC_METRICS_ENABLED = true
+        Admin credentials from keycloak-admin-secret
+    - Mounts keycloak-realm ConfigMap at /opt/keycloak/data/import.
+    - readinessProbe hits /health/ready (Keycloak's built-in health
+      endpoint) so downstream services only start after Keycloak is
+      fully booted and the realm is imported.
+    - ClusterIP Service on port 8080 for internal access.
+
+---------------------------------------------------------------------
+  k8s/spring-cloud/
+---------------------------------------------------------------------
+
+k8s/spring-cloud/10-config-server.yaml
+  PURPOSE : Deploys the Spring Cloud Config Server.
+  WHAT IT DOES :
+    - Uses the custom myapp/config-server:1.0.0 image built from
+      config-server/Dockerfile.
+    - Mounts the config-repo ConfigMap at /config-repo — this is the
+      native filesystem config source.
+    - Passes CONFIG_SERVER_PASSWORD from config-server-secret.
+    - readinessProbe hits /actuator/health so downstream Pods with
+      init containers wait until the Config Server is live.
+    - imagePullPolicy: IfNotPresent — works with minikube image load or
+      a local registry; change to Always for a remote registry.
+
+k8s/spring-cloud/11-api-gateway.yaml
+  PURPOSE : Deploys the Spring Cloud Gateway.
+  WHAT IT DOES :
+    - Two initContainers ensure startup ordering:
+        wait-for-config-server: polls /actuator/health until UP.
+        wait-for-keycloak: polls /health/ready until Keycloak is ready.
+    - Main container uses myapp/api-gateway:1.0.0.
+    - Constructs SPRING_CLOUD_CONFIG_URI from the config-server-secret.
+    - Sets KEYCLOAK_ISSUER_URI to the in-cluster Keycloak service name.
+    - Sets OTEL_EXPORTER_OTLP_ENDPOINT to the OTel Collector service.
+    - ClusterIP Service on port 8090.
+
+---------------------------------------------------------------------
+  k8s/microservices/
+---------------------------------------------------------------------
+
+k8s/microservices/12-user-service.yaml
+  PURPOSE : Deploys the user-service microservice.
+  WHAT IT DOES :
+    - Two initContainers: wait-for-postgres (nc -z postgres-user 5432)
+      and wait-for-config-server (/actuator/health).
+    - Reads all sensitive values (DB password, Config Server password)
+      from Secrets via secretKeyRef.
+    - Sets SPRING_DATASOURCE_URL to the in-cluster postgres-user service.
+    - Sets LOKI_URL for the Logback Loki appender to push logs.
+    - ClusterIP Service on port 8081 — only accessible inside the cluster
+      (traffic arrives via api-gateway).
+
+k8s/microservices/13-product-service.yaml
+  PURPOSE : Deploys the product-service microservice.
+  WHAT IT DOES :
+    - Identical structure to user-service.yaml.
+    - Points at postgres-product:5432/productdb.
+    - ClusterIP Service on port 8082.
+
+k8s/microservices/14-order-service.yaml
+  PURPOSE : Deploys the order-service microservice.
+  WHAT IT DOES :
+    - Three initContainers ensure startup ordering:
+        wait-for-postgres-order: polls nc -z postgres-order 5432.
+        wait-for-config-server: polls /actuator/health.
+        wait-for-keycloak: polls Keycloak /health/ready.
+    - Reads DB password from order-db-secret and client secret from
+      order-client-secret.
+    - Sets SPRING_DATASOURCE_URL to postgres-order:5432/orderdb.
+    - Sets SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_ISSUER_URI
+      and CLIENT_SECRET so the order-service can obtain client_credentials
+      tokens from Keycloak for service-to-service calls.
+    - Sets USER_SERVICE_URL and PRODUCT_SERVICE_URL to the in-cluster
+      service names (user-service:8081 and product-service:8082).
+    - ClusterIP Service on port 8083.
+
+---------------------------------------------------------------------
+  k8s/observability/
+---------------------------------------------------------------------
+
+k8s/observability/14-otel-collector.yaml
+  PURPOSE : Deploys the OpenTelemetry Collector.
+  WHAT IT DOES :
+    - Runs otel/opentelemetry-collector-contrib:latest.
+    - Mounts otel-collector-config ConfigMap at /etc/otel.
+    - Exposes three ports:
+        4317 (OTLP gRPC) — Spring Boot services send traces here.
+        4318 (OTLP HTTP) — alternative transport.
+        8888 (metrics)   — Prometheus scrapes OTel's own metrics.
+    - ClusterIP Service; Spring Boot services reference "otel-collector"
+      by DNS name within the cluster.
+
+k8s/observability/15-prometheus.yaml
+  PURPOSE : Deploys the Prometheus metrics store.
+  WHAT IT DOES :
+    - Runs prom/prometheus:latest with --web.enable-remote-write-receiver
+      so Tempo can push service graph metrics to it.
+    - Mounts prometheus-config ConfigMap for scrape configuration.
+    - Mounts prometheus-pvc for durable TSDB storage.
+    - ClusterIP Service on port 9090.
+
+k8s/observability/16-loki.yaml
+  PURPOSE : Deploys Grafana Loki for log aggregation.
+  WHAT IT DOES :
+    - Runs grafana/loki:3.0.0.
+    - Mounts loki-config ConfigMap and loki-pvc for durable log storage.
+    - Spring Boot services push logs directly to this service via the
+      Loki Logback Appender (http://loki:3100/loki/api/v1/push).
+    - ClusterIP Service on port 3100.
+
+k8s/observability/17-tempo.yaml
+  PURPOSE : Deploys Grafana Tempo for distributed tracing.
+  WHAT IT DOES :
+    - Runs grafana/tempo:latest.
+    - Mounts tempo-config ConfigMap (using subPath: tempo.yaml so only
+      that file is mounted, not the whole ConfigMap directory).
+    - Exposes three ports:
+        3100 — Tempo HTTP API (Grafana queries traces here).
+        4317 — OTLP gRPC receiver (OTel Collector forwards traces here).
+        4318 — OTLP HTTP receiver.
+    - Mounts tempo-pvc for durable trace block storage.
+
+k8s/observability/18-grafana.yaml
+  PURPOSE : Deploys Grafana for unified metrics/logs/traces visualisation.
+  WHAT IT DOES :
+    - Runs grafana/grafana:11.0.0.
+    - Reads admin password from grafana-secret.
+    - Mounts grafana-datasources ConfigMap at the provisioning/datasources
+      directory so Prometheus, Loki, and Tempo are auto-configured with
+      cross-datasource correlation on startup.
+    - Mounts grafana-pvc for persistent dashboard storage.
+    - ClusterIP Service on port 3000.
+
+---------------------------------------------------------------------
+  k8s/frontend/
+---------------------------------------------------------------------
+
+k8s/frontend/19-frontend.yaml
+  PURPOSE : Deploys the Angular SPA served by nginx.
+  WHAT IT DOES :
+    - Runs the myapp/frontend:1.0.0 image (built from frontend/Dockerfile).
+    - Mounts nginx-config ConfigMap at /etc/nginx/conf.d replacing the
+      default nginx config with the custom default.conf that:
+        * Serves Angular's index.html for all unknown routes (SPA fallback).
+        * Proxies /api/ to api-gateway:8090 inside the cluster.
+    - imagePullPolicy: IfNotPresent for local cluster workflows.
+    - ClusterIP Service on port 80; external access is via Ingress.
+
+---------------------------------------------------------------------
+  k8s/20-ingress.yaml
+---------------------------------------------------------------------
+
+k8s/20-ingress.yaml
+  PURPOSE : Exposes three services externally through the nginx Ingress
+            Controller using hostname-based virtual hosting.
+  WHAT IT DOES :
+    - Requires an nginx Ingress Controller installed in the cluster
+      (minikube addons enable ingress or equivalent).
+    - Defines three virtual hosts:
+        myapp.local    → frontend:80 (and /api → api-gateway:8090)
+        keycloak.local → keycloak:8080 (Admin Console + OIDC endpoints)
+        grafana.local  → grafana:3000 (monitoring dashboards)
+    - Sets proxy-read-timeout: 300 so Keycloak's slow first-boot does
+      not cause gateway timeouts.
+    - Users must add the Ingress IP to their hosts file:
+        127.0.0.1  myapp.local keycloak.local grafana.local
+      (use: minikube ip to get the correct IP for minikube clusters)
+
+=====================================================================
+  KUBERNETES — HOW THE PIECES FIT TOGETHER
+=====================================================================
+
+STARTUP ORDER (enforced by initContainers and probe ordering):
+  1. Namespace, Secrets, ConfigMaps, PVCs created (no Pods yet)
+  2. postgres-keycloak, postgres-user, postgres-product, postgres-order
+     StatefulSets start — readinessProbe pg_isready gates all dependents
+  3. keycloak Deployment starts (initContainer waits for postgres-keycloak)
+     — readinessProbe /health/ready gates config-server, gateways
+  4. config-server Deployment starts (standalone, no DB dependency)
+     — readinessProbe /actuator/health gates all Spring Boot apps
+  5. api-gateway, user-service, product-service, order-service start
+     in parallel (each has initContainers waiting for config-server +
+     their DB/keycloak; order-service also needs user-service and
+     product-service to be reachable for runtime calls)
+  6. observability stack starts in parallel (no strong ordering needed)
+  7. frontend starts (depends on api-gateway being reachable for nginx proxy)
+  8. Ingress routes external traffic to frontend, keycloak, grafana
+
+DNS RESOLUTION IN-CLUSTER:
+  All services reference each other by Kubernetes Service name within
+  the myapp namespace. DNS format: <service-name>.<namespace>.svc.cluster.local
+  Short form within same namespace: <service-name>
+  Examples used in manifests:
+    postgres-keycloak  → jdbc:postgresql://postgres-keycloak:5432/keycloak
+    keycloak           → http://keycloak:8080/realms/myapp-realm
+    config-server      → http://config-server:8888
+    otel-collector     → http://otel-collector:4317
+    loki               → http://loki:3100/loki/api/v1/push
+
+CUSTOM IMAGE BUILD PROCESS:
+  Before deploying to K8s, build and load the five custom images:
+    docker build -t myapp/config-server:1.0.0   ./config-server
+    docker build -t myapp/api-gateway:1.0.0     ./api-gateway
+    docker build -t myapp/user-service:1.0.0    ./user-service
+    docker build -t myapp/product-service:1.0.0  ./product-service
+    docker build -t myapp/order-service:1.0.0    ./order-service
+    docker build -t myapp/frontend:1.0.0         ./frontend
+
+  For minikube (no registry needed):
+    minikube image load myapp/config-server:1.0.0
+    minikube image load myapp/api-gateway:1.0.0
+    minikube image load myapp/user-service:1.0.0
+    minikube image load myapp/product-service:1.0.0
+    minikube image load myapp/order-service:1.0.0
+    minikube image load myapp/frontend:1.0.0
+
+  For a remote registry (Docker Hub, ECR, GCR):
+    docker tag  myapp/config-server:1.0.0  <registry>/myapp/config-server:1.0.0
+    docker push <registry>/myapp/config-server:1.0.0
+    (then update image: in the YAML manifests)
+=====================================================================
+
+
+=====================================================================
+  KUBERNETES GCP (k8s_gcp/) — GKE DEPLOYMENT FILES
+=====================================================================
+
+  The k8s_gcp/ directory contains Kubernetes manifests and helper
+  scripts tailored specifically for Google Kubernetes Engine (GKE).
+  It deploys the same 15-service stack as k8s/ and docker-compose.yml
+  but replaces local-only constructs with production-grade GCP equivalents:
+
+    LOCAL k8s/                       GCP k8s_gcp/
+    ─────────────────────────────    ─────────────────────────────────────
+    myapp/<image>:1.0.0 (local)  →  Artifact Registry image paths
+    cluster default storageClass →  standard-rwo (GKE pd-standard RWO)
+    nginx Ingress Controller      →  GKE native Ingress (Google Cloud LB)
+    ClusterIP for LB backends     →  NodePort with BackendConfig CRDs
+    No TLS                        →  Google-managed TLS (ManagedCertificate)
+    No HTTPS redirect             →  FrontendConfig (HTTP→HTTPS at LB level)
+    keycloak.local hostname        →  Real public domain (KEYCLOAK_DOMAIN)
+    http://keycloak:8080 issuer   →  https://KEYCLOAK_DOMAIN (JWT iss match)
+    No autoscaling                →  HorizontalPodAutoscaler on all services
+    No disruption budget          →  PodDisruptionBudget on critical services
+
+  PREREQUISITES:
+    - GCP account with billing enabled
+    - gcloud CLI authenticated
+    - kubectl installed and configured via gcloud
+    - Docker (for building and pushing images)
+    - Three public DNS A records pointing to the reserved static IP
+    - Domains decided for: frontend (APP_DOMAIN), Keycloak
+      (KEYCLOAK_DOMAIN), and Grafana (GRAFANA_DOMAIN)
+
+  DIRECTORY LAYOUT:
+    k8s_gcp/
+    ├── README.md                       Step-by-step GCP deployment guide
+    ├── kustomization.yaml              Master apply list (kubectl apply -k k8s_gcp/)
+    ├── 00-namespace.yaml
+    ├── 01-secrets.yaml
+    ├── configmaps/
+    │   ├── 02-config-repo-cm.yaml      Unchanged from k8s/
+    │   ├── 03-infra-configs-cm.yaml    environment label changed to "gcp"
+    │   └── 04-keycloak-realm-cm.yaml   sslRequired=external, HTTPS redirectUris
+    ├── storage/
+    │   └── 05-pvcs.yaml                storageClassName: standard-rwo
+    ├── databases/
+    │   ├── 06-postgres-keycloak.yaml
+    │   ├── 07-postgres-user.yaml
+    │   ├── 08-postgres-product.yaml
+    │   └── 09-postgres-order.yaml
+    ├── auth/
+    │   └── 10-keycloak.yaml            KC_HOSTNAME, KC_PROXY=edge
+    ├── spring-cloud/
+    │   ├── 11-config-server.yaml       Artifact Registry image
+    │   └── 12-api-gateway.yaml         KEYCLOAK_ISSUER_URI → external HTTPS
+    ├── microservices/
+    │   ├── 13-user-service.yaml
+    │   ├── 14-product-service.yaml
+    │   └── 15-order-service.yaml
+    ├── observability/
+    │   ├── 16-otel-collector.yaml
+    │   ├── 17-prometheus.yaml          securityContext: runAsNonRoot
+    │   ├── 18-loki.yaml
+    │   ├── 19-tempo.yaml
+    │   └── 20-grafana.yaml             GF_SERVER_ROOT_URL → https://GRAFANA_DOMAIN
+    ├── frontend/
+    │   └── 21-frontend.yaml            NodePort service, 2 replicas
+    ├── ingress/
+    │   ├── 22-backend-configs.yaml     BackendConfig per LB backend
+    │   ├── 23-frontend-config.yaml     FrontendConfig (HTTPS redirect)
+    │   ├── 24-managed-certs.yaml       ManagedCertificate (Google TLS)
+    │   └── 25-ingress.yaml             GKE Ingress (ingressClass: gce)
+    ├── scaling/
+    │   ├── 26-hpa.yaml                 HPA for microservices + frontend
+    │   └── 27-pdb.yaml                 PDB for all critical services
+    └── scripts/
+        ├── 00-setup-gcp.sh             One-time GCP infra creation
+        ├── 01-build-push.sh            Build and push all Docker images
+        └── 02-deploy.sh                Full rolling deployment with waits
+
+---------------------------------------------------------------------
+  GCP ACCESS — FULL STEP-BY-STEP WALKTHROUGH
+---------------------------------------------------------------------
+
+  This section covers everything from installing the tooling to
+  having the application running on GKE with HTTPS.
+
+  ── PHASE 0 : TOOL INSTALLATION ──────────────────────────────────
+
+  1. Install Google Cloud SDK (gcloud):
+       https://cloud.google.com/sdk/docs/install
+       Windows: download the installer from the page above.
+       macOS:   brew install --cask google-cloud-sdk
+       Linux:   curl https://sdk.cloud.google.com | bash
+
+  2. Verify installation:
+       gcloud version
+
+  3. Install kubectl via gcloud:
+       gcloud components install kubectl
+
+  4. Install the GKE authentication plugin:
+       gcloud components install gke-gcloud-auth-plugin
+
+  5. Verify kubectl:
+       kubectl version --client
+
+  ── PHASE 1 : GCP AUTHENTICATION ─────────────────────────────────
+
+  Log in to your Google account:
+    gcloud auth login
+
+  This opens a browser. After approving, credentials are cached at:
+    ~/.config/gcloud/credentials.db    (Linux/macOS)
+    %APPDATA%\gcloud\credentials.db    (Windows)
+
+  Set the application-default credentials (needed by SDK libraries):
+    gcloud auth application-default login
+
+  Set your active project:
+    gcloud config set project YOUR_PROJECT_ID
+
+  Verify which account and project are active:
+    gcloud config list
+
+  ── PHASE 2 : CONFIGURE PLACEHOLDER VALUES ───────────────────────
+
+  Every manifest in k8s_gcp/ uses five placeholder strings that must
+  be replaced with your actual GCP and domain values before applying.
+
+    Placeholder       Example value              Meaning
+    ─────────────     ─────────────────────────  ─────────────────────
+    REGION            us-central1                GCP region
+    PROJECT_ID        my-gcp-project             GCP project ID
+    APP_DOMAIN        app.example.com            Frontend public URL
+    KEYCLOAK_DOMAIN   keycloak.example.com       Keycloak public URL
+    GRAFANA_DOMAIN    grafana.example.com        Grafana public URL
+
+  Run this from the k8s_gcp/ directory to do a bulk substitution:
+
+    cd k8s_gcp
+    REGION=us-central1
+    PROJECT_ID=my-gcp-project
+    APP_DOMAIN=app.example.com
+    KEYCLOAK_DOMAIN=keycloak.example.com
+    GRAFANA_DOMAIN=grafana.example.com
+
+    grep -rl 'REGION\|PROJECT_ID\|APP_DOMAIN\|KEYCLOAK_DOMAIN\|GRAFANA_DOMAIN' . \
+      | xargs sed -i \
+          -e "s|REGION|${REGION}|g" \
+          -e "s|PROJECT_ID|${PROJECT_ID}|g" \
+          -e "s|APP_DOMAIN|${APP_DOMAIN}|g" \
+          -e "s|KEYCLOAK_DOMAIN|${KEYCLOAK_DOMAIN}|g" \
+          -e "s|GRAFANA_DOMAIN|${GRAFANA_DOMAIN}|g"
+
+  ── PHASE 3 : UPDATE SECRETS ─────────────────────────────────────
+
+  The defaults in 01-secrets.yaml are the same development passwords
+  used in docker-compose.yml. Replace all of them for production.
+
+  Generate a strong base64-encoded value:
+    echo -n "$(openssl rand -base64 32)" | base64    # Linux/macOS
+    [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("yourpassword")) | Out-String  # PowerShell
+
+  Secrets to update in k8s_gcp/01-secrets.yaml:
+    KC_DB_PASSWORD             — Keycloak database password
+    KEYCLOAK_ADMIN_PASSWORD    — Keycloak admin console password
+    USER_DB_PASSWORD           — user-service database password
+    PRODUCT_DB_PASSWORD        — product-service database password
+    ORDER_DB_PASSWORD          — order-service database password
+    ORDER_SERVICE_CLIENT_SECRET — must also match the "secret" field in
+                                  04-keycloak-realm-cm.yaml for the
+                                  order-service-client Keycloak client
+    CONFIG_SERVER_PASSWORD     — Config Server HTTP Basic password
+    GF_SECURITY_ADMIN_PASSWORD — Grafana admin password
+
+  IMPORTANT: After changing ORDER_SERVICE_CLIENT_SECRET, open
+    k8s_gcp/configmaps/04-keycloak-realm-cm.yaml and update the
+    matching "secret": "order-service-secret" value inside the JSON
+    so Keycloak imports the correct client secret when it starts.
+
+  ── PHASE 4 : UPDATE ANGULAR PRODUCTION ENVIRONMENT ──────────────
+
+  The Angular frontend bakes the Keycloak URL into its bundle at
+  build time via environment.prod.ts. Before building the Docker
+  image, update this file with your real GCP domain:
+
+    frontend/src/environments/environment.prod.ts:
+      export const environment = {
+        production: true,
+        keycloakUrl: 'https://YOUR_KEYCLOAK_DOMAIN',
+      };
+
+  If you skip this step the browser will send users to the wrong
+  Keycloak URL and authentication will fail.
+
+  ── PHASE 5 : RUN THE GCP SETUP SCRIPT ───────────────────────────
+
+  From the repository root:
+    bash k8s_gcp/scripts/00-setup-gcp.sh
+
+  What this script does (you can also run the commands manually):
+
+  a) Enables GCP APIs:
+       container.googleapis.com           — GKE control plane
+       artifactregistry.googleapis.com    — Docker image registry
+       compute.googleapis.com             — Static IP, networking
+       certificatemanager.googleapis.com  — Managed TLS certs
+
+  b) Creates an Artifact Registry repository named "myapp":
+       gcloud artifacts repositories create myapp \
+         --repository-format=docker \
+         --location=REGION
+
+  c) Configures Docker to authenticate to Artifact Registry:
+       gcloud auth configure-docker REGION-docker.pkg.dev
+     This writes a credential helper to ~/.docker/config.json so
+     docker push/pull authenticates automatically.
+
+  d) Creates the GKE cluster:
+       gcloud container clusters create myapp-cluster \
+         --region=REGION \
+         --num-nodes=2 \
+         --machine-type=e2-standard-4 \
+         --enable-ip-alias \
+         --enable-autoscaling \
+         --min-nodes=2 --max-nodes=6 \
+         --release-channel=regular
+     e2-standard-4 = 4 vCPU, 16 GB RAM per node.
+     --enable-ip-alias enables VPC-native networking (required for NEGs).
+     --release-channel=regular receives tested stable patches.
+
+  e) Fetches cluster credentials into the local kubeconfig:
+       gcloud container clusters get-credentials myapp-cluster \
+         --region=REGION
+     After this, kubectl commands target the GKE cluster.
+
+  f) Reserves a global static IP for the Ingress:
+       gcloud compute addresses create myapp-static-ip --global
+     Prints the IP address — you need this for the next phase.
+
+  ── PHASE 6 : DNS SETUP ──────────────────────────────────────────
+
+  Log in to your DNS provider and create three A records:
+
+    Name              Type    Value (the static IP from Phase 5)
+    ─────────────     ────    ────────────────────────────────────
+    APP_DOMAIN        A       <static-ip>
+    KEYCLOAK_DOMAIN   A       <static-ip>
+    GRAFANA_DOMAIN    A       <static-ip>
+
+  Propagation can take up to 48 hours but is usually under 10 minutes.
+  Test with: nslookup APP_DOMAIN   (should return the static IP)
+
+  Google-managed TLS certificates will not be provisioned until DNS
+  resolves to the correct static IP, so complete this step before
+  applying manifests. Certificate provisioning itself takes up to
+  60 minutes after DNS is correct.
+
+  ── PHASE 7 : BUILD AND PUSH IMAGES ─────────────────────────────
+
+  From the repository root (after completing Phase 4 for the frontend):
+    bash k8s_gcp/scripts/01-build-push.sh REGION PROJECT_ID
+
+  This builds each of the 6 custom images for linux/amd64 and pushes
+  them to Artifact Registry:
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/config-server:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/api-gateway:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/product-service:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/order-service:1.0.0
+    REGION-docker.pkg.dev/PROJECT_ID/myapp/frontend:1.0.0
+
+  To build and push a single service manually:
+    docker build --platform linux/amd64 \
+      -t REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0 \
+      ./user-service
+    docker push REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0
+
+  Note: --platform linux/amd64 is required when building on an Apple
+  Silicon (ARM) Mac so the image runs on GKE's x86_64 nodes.
+
+  ── PHASE 8 : DEPLOY ─────────────────────────────────────────────
+
+  Option A — automated script (recommended):
+    bash k8s_gcp/scripts/02-deploy.sh
+    The script asks for confirmation, applies all manifests via
+    kustomize, then waits for each component in dependency order.
+
+  Option B — manual:
+    kubectl apply -k k8s_gcp/
+
+  Watch rollout progress:
+    kubectl get pods -n myapp -w
+
+  Check Ingress (GCP LB provisioning takes 5–10 minutes):
+    kubectl get ingress -n myapp
+
+  When the ADDRESS column of the Ingress shows the static IP,
+  the Google Cloud HTTP(S) LB is active and routing traffic.
+
+  ── PHASE 9 : VERIFY TLS CERTIFICATES ───────────────────────────
+
+  ManagedCertificate status:
+    kubectl describe managedcertificate myapp-cert -n myapp
+
+  Possible status values:
+    Provisioning   — Google is requesting the cert (DNS must resolve)
+    FailedNotVisible — DNS does not yet resolve to the static IP
+    Active         — TLS is working; HTTPS is live
+
+  Until status is Active the site is reachable only over HTTP
+  (the FrontendConfig redirect will enforce HTTPS once cert is Active).
+
+  ── PHASE 10 : ACCESS URLS (GCP) ─────────────────────────────────
+
+    https://APP_DOMAIN            — Angular frontend
+    https://APP_DOMAIN/api/       — API Gateway (via Ingress path routing)
+    https://KEYCLOAK_DOMAIN/admin — Keycloak Admin Console
+    https://GRAFANA_DOMAIN        — Grafana dashboards
+
+  Credentials are unchanged from the local setup (see 01-secrets.yaml):
+    Keycloak admin : admin / Admin@1234!
+    Test user      : user1 / User@1234!
+    Test admin     : admin1 / Admin@1234!
+    Grafana        : admin / grafana_pass   (change in secrets!)
+
+---------------------------------------------------------------------
+  k8s_gcp/README.md
+---------------------------------------------------------------------
+
+k8s_gcp/README.md
+  PURPOSE : Human-readable companion to this docs section. Contains
+            the same deployment phases in a compact, copy-paste-ready
+            format suitable for reading directly in the repository.
+  WHAT IT DOES :
+    - Lists all placeholder variables and a one-liner sed command to
+      bulk-replace them across all manifests.
+    - Shows all gcloud commands needed to set up GCP infrastructure.
+    - Documents the DNS A record requirements.
+    - Describes the image build and push steps.
+    - Explains how to verify the deployment and certificate status.
+    - Summarises key differences between k8s/ (local) and k8s_gcp/ (GCP)
+      in a comparison table.
+    - Covers teardown (delete cluster, release static IP).
+
+---------------------------------------------------------------------
+  k8s_gcp/kustomization.yaml
+---------------------------------------------------------------------
+
+k8s_gcp/kustomization.yaml
+  PURPOSE : Kustomize entry point that lists all 28 manifests in the
+            correct apply order for a single-command GCP deployment.
+  WHAT IT DOES :
+    - Same role as k8s/kustomization.yaml but references the GCP-specific
+      files instead.
+    - Apply with: kubectl apply -k k8s_gcp/
+    - Resources are ordered so namespace → secrets → configmaps → PVCs →
+      databases → auth → spring-cloud → microservices → observability →
+      frontend → ingress → scaling are applied in dependency order.
+
+---------------------------------------------------------------------
+  k8s_gcp/00-namespace.yaml
+---------------------------------------------------------------------
+
+k8s_gcp/00-namespace.yaml
+  PURPOSE : Creates the "myapp" namespace on GKE.
+  WHAT IT DOES :
+    - Identical in structure to k8s/00-namespace.yaml.
+    - Label environment is changed to "gcp" to distinguish from the
+      local cluster at a glance.
+
+---------------------------------------------------------------------
+  k8s_gcp/01-secrets.yaml
+---------------------------------------------------------------------
+
+k8s_gcp/01-secrets.yaml
+  PURPOSE : Declares all 8 Kubernetes Secrets for the GCP deployment.
+  WHAT IT DOES :
+    - Same 8 secrets as k8s/01-secrets.yaml (same key names, same
+      secret structure) but values are base64-encoded.
+    - Values ship as the development defaults and MUST be replaced with
+      strong random passwords before applying to GCP.
+    - All secret values are consumed via secretKeyRef in Pod env sections
+      so no password ever appears in a Deployment spec.
+    - Production recommendation: replace with Google Secret Manager +
+      External Secrets Operator so secrets are not stored in etcd
+      (GKE etcd is encrypted at rest, but Secret Manager provides
+       audit logs, versioning, and automatic rotation).
+
+---------------------------------------------------------------------
+  k8s_gcp/configmaps/
+---------------------------------------------------------------------
+
+k8s_gcp/configmaps/02-config-repo-cm.yaml
+  PURPOSE : Identical to k8s/configmaps/02-config-repo-cm.yaml.
+  WHAT IT DOES :
+    - Packages application.yml, user-service.yml, product-service.yml,
+      and order-service.yml as ConfigMap keys.
+    - Mounted into the config-server Pod at /config-repo so the Config
+      Server serves these files via its native filesystem backend.
+    - No GCP-specific changes needed: all configuration values use
+      internal Kubernetes service DNS names which are the same on GKE.
+
+k8s_gcp/configmaps/03-infra-configs-cm.yaml
+  PURPOSE : Packages all infrastructure tool configs as ConfigMaps.
+  WHAT IT DOES :
+    - Same 6 ConfigMaps as k8s/configmaps/03-infra-configs-cm.yaml:
+      prometheus-config, otel-collector-config, loki-config,
+      tempo-config, grafana-datasources, nginx-config.
+    - GCP-specific changes:
+        prometheus-config     : external_labels.environment changed
+                                from "local" to "gcp" so metrics
+                                can be filtered by environment in Grafana.
+        otel-collector-config : service.environment attribute changed
+                                from "local" to "gcp" so traces carry
+                                the correct environment label.
+        tempo-config          : external_labels.environment changed
+                                from "local" to "gcp".
+    - Internal service DNS names are identical on GKE so Prometheus
+      scrape targets, OTel exporter endpoints, and Grafana datasource
+      URLs are unchanged.
+
+k8s_gcp/configmaps/04-keycloak-realm-cm.yaml
+  PURPOSE : Packages the Keycloak realm JSON for GCP.
+  WHAT IT DOES :
+    - Same structure as k8s/configmaps/04-keycloak-realm-cm.yaml but
+      with two critical GCP-specific changes:
+        sslRequired: changed from "none" to "external".
+          "external" = HTTPS required for connections coming from outside
+          the cluster. Internal pod-to-pod connections on plain HTTP
+          (e.g. health checks from the GCP LB to the Keycloak pod) are
+          still allowed. This is the correct setting when TLS is
+          terminated at the Google Cloud HTTP(S) LB.
+        angular-client.redirectUris: changed from
+          ["http://localhost:4200/*", "http://frontend/*", "http://myapp.local/*"]
+          to ["https://APP_DOMAIN/*"]
+          so Keycloak only allows redirects back to the real GCP frontend
+          domain. Wildcard (*) allows any path under APP_DOMAIN.
+        angular-client.webOrigins: changed from localhost/myapp.local
+          to ["https://APP_DOMAIN"] so CORS is restricted to the GCP
+          frontend origin.
+    - Mounted into the Keycloak Pod at /opt/keycloak/data/import.
+      Keycloak --import-realm reads this file on first startup.
+
+---------------------------------------------------------------------
+  k8s_gcp/storage/
+---------------------------------------------------------------------
+
+k8s_gcp/storage/05-pvcs.yaml
+  PURPOSE : Declares PersistentVolumeClaims with GKE-specific storage class.
+  WHAT IT DOES :
+    - Same 8 PVCs as k8s/storage/05-pvcs.yaml but with two differences:
+        storageClassName: standard-rwo is set explicitly.
+          On GKE, "standard-rwo" provisions Google Persistent Disk
+          (pd-standard, HDD) with ReadWriteOnce access mode. This is
+          GKE's recommended class for stateful workloads.
+          Alternative: premium-rwo provisions pd-ssd (higher IOPS, ~2x cost).
+        Sizes increased to production-appropriate values:
+          Database PVCs: 5Gi (was 2Gi)
+          Observability PVCs: 10Gi each (was 5Gi)
+          Grafana PVC: 2Gi (was 1Gi)
+    - All PVCs are ReadWriteOnce — only one GKE node can mount a PD disk
+      at a time, matching single-replica StatefulSet / Deployment replicas.
+    - GKE automatically provisions the underlying Google PD when the PVC
+      is bound (dynamic provisioning via the standard-rwo StorageClass).
+
+---------------------------------------------------------------------
+  k8s_gcp/databases/
+---------------------------------------------------------------------
+
+k8s_gcp/databases/06-postgres-keycloak.yaml
+k8s_gcp/databases/07-postgres-user.yaml
+k8s_gcp/databases/08-postgres-product.yaml
+k8s_gcp/databases/09-postgres-order.yaml
+  PURPOSE : Deploy four dedicated PostgreSQL 16 instances on GKE.
+  WHAT IT DOES :
+    - Identical in logic to the k8s/databases/ equivalents.
+    - Each is a StatefulSet with a headless Service, readiness/liveness
+      probes using pg_isready, and mounts the corresponding GCP PVC.
+    - No image change needed — postgres:16-alpine is pulled from Docker Hub
+      by the GKE nodes directly (GKE nodes have internet egress).
+    - Services remain ClusterIP (headless) — databases are only accessed
+      internally by the microservices.
+
+---------------------------------------------------------------------
+  k8s_gcp/auth/
+---------------------------------------------------------------------
+
+k8s_gcp/auth/10-keycloak.yaml
+  PURPOSE : Deploys Keycloak in production mode on GKE behind the
+            Google Cloud HTTP(S) Load Balancer.
+  WHAT IT DOES :
+    - Same image: quay.io/keycloak/keycloak:24.0.4 with --import-realm.
+    - initContainer waits for postgres-keycloak TCP on port 5432.
+    - GCP-specific environment variables:
+        KC_HOSTNAME: KEYCLOAK_DOMAIN
+          Tells Keycloak what hostname to use when constructing the
+          JWT issuer URL, token endpoints, redirect URIs, and admin
+          console links. With KC_PROXY=edge and this set, Keycloak's
+          issuer will be https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+        KC_PROXY: edge
+          Informs Keycloak it is behind a reverse proxy (the GCP LB)
+          that terminates TLS. Keycloak trusts X-Forwarded-Proto and
+          X-Forwarded-Host headers from the proxy and sets its own
+          URLs to HTTPS even though it listens on plain HTTP internally.
+        KC_HTTP_ENABLED: true
+          Required because the GCP LB backend connection to the
+          Keycloak pod uses plain HTTP (TLS is terminated at the LB).
+        KC_HOSTNAME_STRICT: false
+          Allows requests using any hostname (including the internal
+          "keycloak" service DNS name) to reach the pod. If set to true,
+          only requests with the Host header matching KC_HOSTNAME would
+          succeed, breaking health checks from within the cluster.
+        KC_HOSTNAME_STRICT_HTTPS: false
+          Disables Keycloak's own HTTPS requirement — the GCP LB
+          enforces HTTPS externally; the pod itself speaks HTTP.
+    - Service type: NodePort (not ClusterIP).
+      GKE's HTTP(S) Load Balancer requires NodePort or NEG-enabled
+      services as its backends. The BackendConfig annotation links
+      this service to keycloak-backend-config for health check config.
+    - Resources increased to 500m/1Gi request, 2000m/2Gi limit because
+      Keycloak is a Java application with a large initial heap.
+
+---------------------------------------------------------------------
+  k8s_gcp/spring-cloud/
+---------------------------------------------------------------------
+
+k8s_gcp/spring-cloud/11-config-server.yaml
+  PURPOSE : Deploys the Spring Cloud Config Server on GKE.
+  WHAT IT DOES :
+    - Same logic as k8s/spring-cloud/10-config-server.yaml.
+    - Image changed to Artifact Registry path:
+        REGION-docker.pkg.dev/PROJECT_ID/myapp/config-server:1.0.0
+    - Service type: ClusterIP (not exposed externally; only Spring Boot
+      services access it internally during startup).
+    - No KEYCLOAK_ISSUER_URI needed — Config Server has no security role.
+
+k8s_gcp/spring-cloud/12-api-gateway.yaml
+  PURPOSE : Deploys the Spring Cloud Gateway on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+    - Two initContainers enforce startup ordering (same as local k8s/).
+    - KEYCLOAK_ISSUER_URI changed to https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+      This is the critical GCP difference: the API Gateway validates
+      the JWT's "iss" claim. Because Keycloak on GCP uses KC_HOSTNAME=
+      KEYCLOAK_DOMAIN and KC_PROXY=edge, it puts "https://KEYCLOAK_DOMAIN/
+      realms/myapp-realm" in the "iss" claim. The issuer URI in Spring
+      Security must match exactly — using the internal http://keycloak:8080
+      URL would cause JWT validation failures.
+    - Service type: NodePort with BackendConfig annotation so the GCP LB
+      health-checks /actuator/health:8090 instead of /.
+    - Resources increased to 200m/512Mi request, 800m/1Gi limit.
+
+---------------------------------------------------------------------
+  k8s_gcp/microservices/
+---------------------------------------------------------------------
+
+k8s_gcp/microservices/13-user-service.yaml
+  PURPOSE : Deploys user-service on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+    - KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm
+      (must match the iss claim in tokens for JWT validation).
+    - Service type: ClusterIP — user-service is not directly exposed
+      to the internet; all external traffic arrives via the API Gateway.
+    - initContainers wait for postgres-user:5432 and config-server health.
+
+k8s_gcp/microservices/14-product-service.yaml
+  PURPOSE : Deploys product-service on GKE.
+  WHAT IT DOES :
+    - Identical in structure to 13-user-service.yaml.
+    - KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+    - Service type: ClusterIP.
+
+k8s_gcp/microservices/15-order-service.yaml
+  PURPOSE : Deploys order-service on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+    - Three initContainers: wait for postgres-order, config-server,
+      and keycloak (because order-service fetches machine tokens at
+      runtime, it needs Keycloak to be ready before it starts).
+    - KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm
+      (for validating inbound user JWTs — must match iss claim).
+    - KEYCLOAK_TOKEN_URI: http://keycloak:8080/realms/myapp-realm/
+      protocol/openid-connect/token
+      Uses the internal cluster URL (not the public HTTPS one) for
+      service-to-service client_credentials token fetches. This avoids
+      sending machine tokens through the public internet and eliminates
+      the latency of a round-trip through the Google Cloud LB.
+      The resulting tokens still carry "iss: https://KEYCLOAK_DOMAIN/..."
+      because Keycloak uses KC_HOSTNAME for the claim regardless of
+      which endpoint issued the token.
+    - ORDER_SERVICE_CLIENT_SECRET from order-client-secret Secret.
+    - Service type: ClusterIP.
+
+---------------------------------------------------------------------
+  k8s_gcp/observability/
+---------------------------------------------------------------------
+
+k8s_gcp/observability/16-otel-collector.yaml
+  PURPOSE : Deploys the OTel Collector on GKE.
+  WHAT IT DOES :
+    - Same as k8s/observability/14-otel-collector.yaml.
+    - Service type: ClusterIP. Not exposed externally.
+    - Mounts otel-collector-config ConfigMap (environment label = "gcp").
+
+k8s_gcp/observability/17-prometheus.yaml
+  PURPOSE : Deploys Prometheus on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=65534, runAsNonRoot=true,
+      fsGroup=65534 so Prometheus can write to the PVC without
+      requiring root (GKE enforces this on hardened node pools).
+    - readinessProbe hits /-/ready and livenessProbe hits /-/healthy
+      (Prometheus-native health endpoints, more reliable than the
+      default path / which serves the Prometheus UI).
+    - Service type: ClusterIP. Scraped internally by Grafana.
+
+k8s_gcp/observability/18-loki.yaml
+  PURPOSE : Deploys Grafana Loki on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=10001 (Loki's dedicated UID).
+    - readinessProbe hits /ready (Loki's built-in readiness endpoint).
+    - Service type: ClusterIP.
+
+k8s_gcp/observability/19-tempo.yaml
+  PURPOSE : Deploys Grafana Tempo on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=10001.
+    - readinessProbe hits /ready.
+    - Mounts tempo-config ConfigMap with subPath: tempo.yaml.
+    - Service type: ClusterIP.
+
+k8s_gcp/observability/20-grafana.yaml
+  PURPOSE : Deploys Grafana on GKE.
+  WHAT IT DOES :
+    - Adds securityContext: runAsUser=472 (Grafana's dedicated UID).
+    - GCP-specific addition: GF_SERVER_ROOT_URL = https://GRAFANA_DOMAIN.
+      This tells Grafana its externally visible URL, which is used in
+      share links, OAuth redirects, and email alerts.
+    - readinessProbe hits /api/health (Grafana's REST health endpoint).
+    - Service type: NodePort with cloud.google.com/backend-config
+      annotation so the GCP LB health-checks /api/health:3000.
+
+---------------------------------------------------------------------
+  k8s_gcp/frontend/
+---------------------------------------------------------------------
+
+k8s_gcp/frontend/21-frontend.yaml
+  PURPOSE : Deploys the Angular SPA served by nginx on GKE.
+  WHAT IT DOES :
+    - Image: Artifact Registry path.
+      IMPORTANT: the image must be built from a frontend/Dockerfile after
+      updating environment.prod.ts with the real KEYCLOAK_DOMAIN.
+    - replicas: 2 instead of 1 for basic availability (HPA manages further
+      scaling from this baseline).
+    - readinessProbe and livenessProbe hit /index.html so the LB only
+      routes traffic to nginx pods that are serving the Angular bundle.
+    - Mounts nginx-config ConfigMap at /etc/nginx/conf.d for the SPA
+      fallback and /api/ proxy configuration.
+    - Service type: NodePort with cloud.google.com/backend-config
+      annotation so the GCP LB health-checks /index.html:80.
+
+---------------------------------------------------------------------
+  k8s_gcp/ingress/
+---------------------------------------------------------------------
+
+k8s_gcp/ingress/22-backend-configs.yaml
+  PURPOSE : Defines GKE BackendConfig CRDs to configure Google Cloud
+            LB health checks for each Ingress backend service.
+  WHAT IT DOES :
+    - BackendConfig is a GKE-specific CRD (cloud.google.com/v1).
+      Without it, the Google Cloud LB sends health check probes to
+      GET / on the service port. This returns 4xx for Spring Boot
+      (no handler at /), 302 for Keycloak (redirects to /auth), and
+      200 for nginx (serves index.html but this is coincidence).
+      BackendConfig overrides the health check path per service:
+        frontend-backend-config    : GET /index.html on port 80
+        api-gateway-backend-config : GET /actuator/health on port 8090
+        keycloak-backend-config    : GET /health/ready on port 8080
+        grafana-backend-config     : GET /api/health on port 3000
+    - Also configures timeoutSec (how long the LB waits for a response)
+      and drainingTimeoutSec (how long the LB waits before removing a
+      backend from rotation during a rolling update).
+    - Each BackendConfig is linked to its Service via the annotation:
+        cloud.google.com/backend-config: '{"default": "<config-name>"}'
+      on the Service itself (not on the Pod or Deployment).
+
+k8s_gcp/ingress/23-frontend-config.yaml
+  PURPOSE : Defines a GKE FrontendConfig CRD to enforce HTTP→HTTPS
+            redirect at the Google Cloud LB layer.
+  WHAT IT DOES :
+    - FrontendConfig is a GKE-specific CRD (networking.gke.io/v1beta1).
+    - redirectToHttps.enabled: true instructs the GCP LB to respond
+      with 301 Moved Permanently to any HTTP request, sending the
+      client to the HTTPS equivalent URL.
+    - This redirect happens at the load balancer before any request
+      reaches a pod — no application code change needed.
+    - Linked to the Ingress via annotation:
+        networking.gke.io/v1beta1.FrontendConfig: "myapp-frontend-config"
+
+k8s_gcp/ingress/24-managed-certs.yaml
+  PURPOSE : Provisions Google-managed SSL/TLS certificates for all
+            three public domains via a ManagedCertificate CRD.
+  WHAT IT DOES :
+    - ManagedCertificate (networking.gke.io/v1) tells GCP to request
+      and automatically renew a TLS certificate from Google's CA for
+      the listed domain names.
+    - All three domains (APP_DOMAIN, KEYCLOAK_DOMAIN, GRAFANA_DOMAIN)
+      are included in a single certificate.
+    - Provisioning requires:
+        1. The domains' DNS A records resolve to the static IP.
+        2. The Ingress is created and references this ManagedCertificate.
+    - Once provisioned (status: Active), GCP handles renewal automatically
+      — there is no need for cert-manager or Let's Encrypt.
+    - Linked to the Ingress via annotation:
+        networking.gke.io/managed-certificates: "myapp-cert"
+
+k8s_gcp/ingress/25-ingress.yaml
+  PURPOSE : Creates the Google Cloud HTTP(S) Load Balancer that routes
+            public traffic to frontend, api-gateway, keycloak, and grafana.
+  WHAT IT DOES :
+    - Ingress class: gce — uses the GKE-native Ingress controller which
+      creates a Google Cloud HTTP(S) LB (not nginx).
+    - Annotation kubernetes.io/ingress.global-static-ip-name: myapp-static-ip
+      assigns the reserved static IP to this LB so the IP never changes
+      across LB recreations.
+    - Annotation networking.gke.io/managed-certificates: myapp-cert
+      links the ManagedCertificate — GCP attaches the provisioned TLS
+      cert to the LB's HTTPS frontend.
+    - Annotation networking.gke.io/v1beta1.FrontendConfig: myapp-frontend-config
+      links the FrontendConfig — enables HTTP→HTTPS redirect.
+    - Path routing rules:
+        APP_DOMAIN/api  → api-gateway NodePort service (port 8090)
+        APP_DOMAIN/     → frontend NodePort service    (port 80)
+        KEYCLOAK_DOMAIN → keycloak NodePort service    (port 8080)
+        GRAFANA_DOMAIN  → grafana NodePort service     (port 3000)
+    - IMPORTANT: the api-gateway rule is listed before the / rule so
+      /api requests are matched first (more specific path wins).
+    - The GCP LB provisions in 5–10 minutes after first apply.
+      During provisioning the ADDRESS column of kubectl get ingress shows
+      no value. Once it shows the static IP, routing is active.
+
+---------------------------------------------------------------------
+  k8s_gcp/scaling/
+---------------------------------------------------------------------
+
+k8s_gcp/scaling/26-hpa.yaml
+  PURPOSE : Defines HorizontalPodAutoscalers for all stateless services.
+  WHAT IT DOES :
+    - Creates 5 HPAs targeting api-gateway, user-service, product-service,
+      order-service, and frontend Deployments.
+    - Uses autoscaling/v2 API (supports multiple metric types).
+    - Scales based on two metrics simultaneously:
+        CPU utilization target: 70%
+        Memory utilization target: 80%
+      When either threshold is crossed the HPA adds replicas up to maxReplicas.
+    - Scale ranges:
+        api-gateway, microservices: 1 min → 4 max replicas
+        frontend: 2 min → 6 max replicas (starts at 2 for basic HA)
+    - Requires GKE Metrics Server (enabled by default on GKE Standard
+      and Autopilot). Verify with: kubectl top pods -n myapp
+
+k8s_gcp/scaling/27-pdb.yaml
+  PURPOSE : Defines PodDisruptionBudgets to maintain availability during
+            voluntary disruptions (node upgrades, cluster maintenance).
+  WHAT IT DOES :
+    - Creates 7 PDBs for: api-gateway, user-service, product-service,
+      order-service, keycloak, frontend, config-server.
+    - minAvailable: 1 guarantees at least one pod of each service stays
+      running when nodes are drained for upgrades or preemption.
+    - Without PDBs, a node drain could simultaneously terminate all pods
+      of a single-replica service, causing downtime.
+    - PDBs protect only against voluntary disruptions. Involuntary
+      disruptions (hardware failure, OOM kill) are not covered.
+
+---------------------------------------------------------------------
+  k8s_gcp/scripts/
+---------------------------------------------------------------------
+
+k8s_gcp/scripts/00-setup-gcp.sh
+  PURPOSE : One-time GCP infrastructure setup script.
+  WHAT IT DOES :
+    - Runs gcloud auth login and sets the active project.
+    - Enables all required GCP APIs in one batch call.
+    - Creates the Artifact Registry repository named "myapp" in the
+      configured region.
+    - Runs gcloud auth configure-docker to write a credential helper
+      to ~/.docker/config.json for the Artifact Registry hostname.
+    - Creates a GKE Standard cluster with autoscaling (min 2, max 6
+      nodes), IP aliasing, and the "regular" release channel.
+    - Fetches cluster credentials via gcloud container clusters
+      get-credentials so kubectl is immediately usable.
+    - Reserves a global static IP (myapp-static-ip) for the Ingress.
+    - Prints the static IP at the end with instructions for DNS setup.
+  USAGE :
+    Edit the variables at the top (PROJECT_ID, REGION, etc.) then:
+      bash k8s_gcp/scripts/00-setup-gcp.sh
+
+k8s_gcp/scripts/01-build-push.sh
+  PURPOSE : Builds all 6 custom Docker images and pushes them to
+            Artifact Registry.
+  WHAT IT DOES :
+    - Accepts REGION, PROJECT_ID, and optional TAG as positional args.
+    - Iterates over all 6 services: config-server, api-gateway,
+      user-service, product-service, order-service, frontend.
+    - Builds each with --platform linux/amd64 (required on ARM Macs
+      to produce images that run on GKE's x86_64 nodes).
+    - Frontend is built with --build-arg BUILD_CONFIGURATION=production
+      which the Dockerfile uses to run ng build --configuration production,
+      baking in environment.prod.ts values (including KEYCLOAK_DOMAIN).
+    - Pushes each image immediately after building.
+    - Fails fast (set -euo pipefail) — if any build or push fails the
+      script stops rather than continuing with broken images.
+  USAGE :
+    bash k8s_gcp/scripts/01-build-push.sh us-central1 my-gcp-project
+    bash k8s_gcp/scripts/01-build-push.sh us-central1 my-gcp-project 2.0.0
+
+k8s_gcp/scripts/02-deploy.sh
+  PURPOSE : Applies all manifests and waits for each component to
+            reach a healthy state in dependency order.
+  WHAT IT DOES :
+    - Reads the current kubectl context and asks for confirmation so you
+      can verify you are targeting the correct GKE cluster before any
+      changes are made.
+    - Runs kubectl apply -k with the k8s_gcp/ directory.
+    - Waits for StatefulSets (databases) first, then Keycloak, then
+      Config Server, then all Spring Boot services, then observability,
+      then frontend. This matches the runtime dependency chain.
+    - After deployment, prints Ingress status (GCP LB provisioning
+      takes 5–10 minutes) and ManagedCertificate status (certificate
+      provisioning takes up to 60 minutes after DNS resolves).
+    - Prints all pod statuses at the end.
+  USAGE :
+    bash k8s_gcp/scripts/02-deploy.sh
+
+---------------------------------------------------------------------
+  CONCEPT: GKE INGRESS vs. NGINX INGRESS
+---------------------------------------------------------------------
+
+  LOCAL k8s/ uses the nginx Ingress Controller:
+    - An nginx Pod inside the cluster intercepts requests coming
+      through a NodePort or LoadBalancer Service.
+    - Configuration: ingressClassName: nginx or annotation
+      kubernetes.io/ingress.class: "nginx".
+    - Health checks: nginx proxies to any backend that has Ready pods.
+    - TLS: managed by cert-manager or manual Secret with a PEM cert.
+    - Static IP: not reserved; the LoadBalancer Service IP changes
+      unless specifically requested.
+
+  GCP k8s_gcp/ uses the GKE native Ingress (class: gce):
+    - No in-cluster proxy. GKE programs a Google Cloud HTTP(S) Load
+      Balancer (an external GCP resource) directly from the Ingress spec.
+    - Health checks: the GCP LB health-probes backend services directly
+      via NEGs or NodePort. Without BackendConfig, it probes GET / on
+      the node port. BackendConfig overrides this with correct paths.
+    - TLS: ManagedCertificate CRD delegates to Google's CA. No cert-manager.
+    - Static IP: reserved with gcloud compute addresses create --global
+      and referenced in the Ingress annotation.
+    - Backend services must be type NodePort (not ClusterIP) because
+      the GCP LB routes to individual node IPs and ports.
+    - FrontendConfig CRD adds LB-level features (HTTPS redirect, SSL policy)
+      not available via standard Ingress annotations.
+
+---------------------------------------------------------------------
+  CONCEPT: JWT ISSUER URI ON GCP
+---------------------------------------------------------------------
+
+  WHY THE ISSUER URI CHANGES FROM LOCAL TO GCP:
+
+  In Docker Compose and the local k8s/, Keycloak is configured without
+  KC_HOSTNAME. It defaults to using the internal hostname as the issuer,
+  producing tokens with:
+    "iss": "http://keycloak:8080/realms/myapp-realm"
+
+  Spring Boot services set KEYCLOAK_ISSUER_URI=http://keycloak:8080/...
+  which matches the iss claim — JWT validation succeeds.
+
+  On GCP with KC_HOSTNAME=KEYCLOAK_DOMAIN and KC_PROXY=edge, Keycloak
+  sets its own issuer to the external HTTPS domain:
+    "iss": "https://KEYCLOAK_DOMAIN/realms/myapp-realm"
+
+  Spring Boot's resource server validates the iss claim against
+  spring.security.oauth2.resourceserver.jwt.issuer-uri. If this is
+  still set to http://keycloak:8080/... the validation fails with:
+    "The iss claim is not valid"
+
+  Therefore all Spring Boot services in k8s_gcp/ set:
+    KEYCLOAK_ISSUER_URI: https://KEYCLOAK_DOMAIN/realms/myapp-realm
+
+  INTERNAL TOKEN FETCH (order-service only):
+  The KEYCLOAK_TOKEN_URI for client_credentials uses the internal URL:
+    http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/token
+  The resulting tokens still carry the correct external iss claim because
+  Keycloak uses KC_HOSTNAME regardless of which endpoint was called.
+  Using the internal URL avoids sending machine credentials through the
+  public internet and eliminates the GCP LB round-trip latency.
+
+---------------------------------------------------------------------
+  CONCEPT: BackendConfig HEALTH CHECKS
+---------------------------------------------------------------------
+
+  The Google Cloud HTTP(S) LB periodically probes each backend service
+  to determine pod health. By default it sends GET / to the node port
+  of every backend. This breaks Spring Boot and Keycloak:
+
+    Spring Boot (/):  no handler registered → 404 Not Found
+    Keycloak (/):     redirects to /auth     → 302 → LB marks UNHEALTHY
+    Grafana (/):      serves a redirect      → 302 → LB marks UNHEALTHY
+    nginx (/):        serves index.html      → 200 → works by coincidence
+
+  BackendConfig overrides the probe path per service:
+    frontend    → /index.html         (200 when nginx is serving)
+    api-gateway → /actuator/health    (200 when Spring Boot is UP)
+    keycloak    → /health/ready       (200 when realm is imported)
+    grafana     → /api/health         (200 from Grafana's REST API)
+
+  BackendConfig is linked to a Service via annotation on the Service:
+    cloud.google.com/backend-config: '{"default": "<config-name>"}'
+
+---------------------------------------------------------------------
+  KUBERNETES GCP — HOW THE PIECES FIT TOGETHER
+---------------------------------------------------------------------
+
+STARTUP ORDER (enforced by initContainers):
+  1. Namespace, Secrets, ConfigMaps, PVCs created by kustomize apply
+  2. postgres-keycloak, postgres-user, postgres-product, postgres-order
+     StatefulSets start in parallel — GKE dynamically provisions PDs
+  3. keycloak Deployment starts (initContainer polls postgres-keycloak:5432)
+  4. config-server Deployment starts independently
+  5. api-gateway, user-service, product-service, order-service start
+     in parallel (each initContainer waits for config-server + DB + keycloak)
+  6. Observability stack starts in parallel
+  7. frontend starts with 2 replicas
+  8. GKE programs the Google Cloud LB from the Ingress spec
+  9. ManagedCertificate provisioning begins (requires DNS to be set)
+
+GCP LB ROUTING FLOW (after Ingress is Active):
+  Browser → https://APP_DOMAIN/api/orders
+  → Google Cloud LB (terminates TLS, checks BackendConfig health)
+  → api-gateway NodePort → api-gateway Pod:8090
+  → api-gateway validates JWT (iss: https://KEYCLOAK_DOMAIN/...)
+  → TokenRelay filter copies JWT
+  → order-service:8083/api/orders
+  → order-service validates JWT again (defense in depth)
+
+  Browser → https://APP_DOMAIN/dashboard
+  → Google Cloud LB → frontend NodePort → nginx Pod:80
+  → nginx serves /index.html (SPA fallback)
+  → Angular router renders DashboardComponent
+
+AUTOSCALING FLOW:
+  Traffic spike → CPU > 70% on api-gateway Pods
+  → HPA increases replicas from 1 to 2 (then 3, then max 4)
+  → GKE schedules new Pods; BackendConfig health check confirms readiness
+  → GCP LB adds new Pods to the backend pool
+  → Traffic decreases → CPU < 70% sustained for cooldown period
+  → HPA scales down
+
+DNS IN-CLUSTER (unchanged from local k8s/):
+  Internal calls still use short Kubernetes service DNS:
+    postgres-keycloak → jdbc:postgresql://postgres-keycloak:5432/keycloak
+    keycloak          → http://keycloak:8080 (health checks, token fetch)
+    config-server     → http://config-server:8888
+    otel-collector    → http://otel-collector:4317
+    loki              → http://loki:3100
+  External calls use real domains:
+    JWT iss claim validation → https://KEYCLOAK_DOMAIN/realms/myapp-realm
+
+COMMON GKE OPERATIONS:
+  Get all pods:
+    kubectl get pods -n myapp
+
+  Watch a rolling update:
+    kubectl rollout status deployment/user-service -n myapp
+
+  Tail logs:
+    kubectl logs -n myapp deployment/user-service -f
+
+  Check Ingress and LB IP:
+    kubectl get ingress -n myapp
+
+  Check certificate status:
+    kubectl describe managedcertificate myapp-cert -n myapp
+
+  Scale a deployment manually:
+    kubectl scale deployment/user-service --replicas=3 -n myapp
+
+  Exec into a running pod:
+    kubectl exec -it -n myapp deployment/keycloak -- /bin/bash
+
+  Restart a deployment (picks up new ConfigMap values):
+    kubectl rollout restart deployment/user-service -n myapp
+
+  Update a single image after push:
+    kubectl set image deployment/user-service \
+      user-service=REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.1 \
+      -n myapp
+
+  Check HPA status:
+    kubectl get hpa -n myapp
+
+  Check PDB status:
+    kubectl get pdb -n myapp
+
+  View resource usage:
+    kubectl top pods -n myapp
+
+  Delete all resources (teardown):
+    kubectl delete -k k8s_gcp/
+    gcloud container clusters delete myapp-cluster --region=REGION
+    gcloud compute addresses delete myapp-static-ip --global
+=====================================================================
+
+
+=====================================================================
+HELM GCP (helm_gcp/) — HELM CHART FOR GKE DEPLOYMENT
+=====================================================================
+
+PURPOSE
+-------
+helm_gcp/ is a single Helm chart (not an umbrella chart) that packages
+the entire 15-service stack — including infrastructure, microservices,
+observability, ingress, autoscaling, and PodDisruptionBudgets — into
+one deployable unit for Google Kubernetes Engine (GKE).
+
+Key advantages over raw kubectl manifests (k8s_gcp/):
+  - Single install / upgrade / rollback command
+  - All domain names, image tags, replica counts, and resource limits
+    are centralized in values.yaml — no sed / envsubst needed
+  - Atomic upgrades with --atomic (auto-rollback on failure)
+  - Versioned release history: helm history myapp
+  - Conditional rendering (HPA and PDB wrapped in {{- if .Values... }})
+  - Clean uninstall: helm uninstall removes all managed resources
+
+DIRECTORY STRUCTURE
+-------------------
+helm_gcp/
+├── Chart.yaml                         Chart metadata
+├── values.yaml                        All configurable defaults
+├── values.secrets.yaml.example        Template for secrets override file
+├── .helmignore                        Files excluded from packaging
+├── templates/
+│   ├── _helpers.tpl                   Named template library
+│   ├── NOTES.txt                      Post-install instructions
+│   ├── namespace.yaml                 Namespace definition
+│   ├── secrets.yaml                   8 Kubernetes Secret objects
+│   ├── configmaps/
+│   │   ├── config-repo-cm.yaml        Spring Cloud Config native source
+│   │   ├── keycloak-realm-cm.yaml     Keycloak realm JSON (with Helm values)
+│   │   └── infra-configs-cm.yaml      Prometheus / Loki / Tempo / OTel / Grafana configs
+│   ├── storage/
+│   │   └── pvcs.yaml                  8 PersistentVolumeClaims
+│   ├── databases/
+│   │   ├── postgres-keycloak.yaml     Keycloak PostgreSQL StatefulSet + headless Service
+│   │   ├── postgres-user.yaml         user-service PostgreSQL StatefulSet + headless Service
+│   │   ├── postgres-product.yaml      product-service PostgreSQL StatefulSet + headless Service
+│   │   └── postgres-order.yaml        order-service PostgreSQL StatefulSet + headless Service
+│   ├── auth/
+│   │   └── keycloak.yaml             Keycloak Deployment + NodePort Service
+│   ├── spring-cloud/
+│   │   ├── config-server.yaml        Config Server Deployment + ClusterIP Service
+│   │   └── api-gateway.yaml          API Gateway Deployment + NodePort Service
+│   ├── microservices/
+│   │   ├── user-service.yaml         User Service Deployment + ClusterIP Service
+│   │   ├── product-service.yaml      Product Service Deployment + ClusterIP Service
+│   │   └── order-service.yaml        Order Service Deployment + ClusterIP Service
+│   ├── observability/
+│   │   ├── otel-collector.yaml       OpenTelemetry Collector Deployment + ClusterIP Service
+│   │   ├── prometheus.yaml           Prometheus Deployment + ClusterIP Service
+│   │   ├── loki.yaml                 Loki Deployment + ClusterIP Service
+│   │   ├── tempo.yaml                Tempo Deployment + ClusterIP Service
+│   │   └── grafana.yaml              Grafana Deployment + NodePort Service
+│   ├── frontend/
+│   │   └── frontend.yaml             Angular/nginx Deployment + NodePort Service
+│   ├── ingress/
+│   │   ├── backend-configs.yaml      4 BackendConfig CRDs (GCP health checks)
+│   │   ├── frontend-config.yaml      FrontendConfig CRD (HTTP→HTTPS redirect)
+│   │   ├── managed-certs.yaml        ManagedCertificate CRD (Google-managed TLS)
+│   │   └── ingress.yaml              GKE Ingress (Google Cloud HTTP(S) LB)
+│   └── scaling/
+│       ├── hpa.yaml                  5 HorizontalPodAutoscalers
+│       └── pdb.yaml                  7 PodDisruptionBudgets
+└── scripts/
+    ├── install.sh                    First-time Helm install on GKE
+    ├── upgrade.sh                    Helm upgrade for image/config changes
+    └── uninstall.sh                  Helm uninstall (PVC-preserving by default)
+
+=====================================================================
+FILE-BY-FILE DOCUMENTATION
+=====================================================================
+
+helm_gcp/Chart.yaml
+  PURPOSE : Helm chart descriptor.
+  WHAT IT DOES :
+    - apiVersion: v2 (Helm 3 only).
+    - type: application (not library).
+    - version: 1.0.0 — chart version, bump when chart structure changes.
+    - appVersion: "1.0.0" — application version, displayed in helm list.
+    - No external chart dependencies (all resources are self-contained templates).
+
+helm_gcp/values.yaml
+  PURPOSE : Single source of truth for all configurable values.
+  SECTIONS :
+    gcp:
+      region, projectId, artifactRegistry.repository, staticIpName.
+      Drives the myapp.image helper: REGION-docker.pkg.dev/PROJECT_ID/REPO/SERVICE:TAG.
+
+    domain:
+      app, keycloak, grafana.
+      Used in Ingress rules, ManagedCertificate domains, GF_SERVER_ROOT_URL,
+      Keycloak KC_HOSTNAME, KEYCLOAK_ISSUER_URI, realm redirectUris/webOrigins.
+
+    image:
+      tag: "1.0.0" — image tag for all 6 custom images.
+      pullPolicy: IfNotPresent.
+
+    secrets:
+      base64-encoded placeholder values (development defaults only).
+      All 9 secrets: keycloakDbPassword, keycloakAdmin, keycloakAdminPassword,
+      userDbPassword, productDbPassword, orderDbPassword, orderClientSecret,
+      configServerPassword, grafanaAdminPassword.
+      MUST be overridden via values.secrets.yaml before deploying.
+
+    storage:
+      class: standard-rwo (GKE pd-standard, ReadWriteOnce).
+      sizes: 5Gi for each Postgres PVC; 10Gi for Prometheus/Loki/Tempo; 2Gi for Grafana.
+
+    replicas:
+      Starting replica counts for all 12 Deployments. HPA overrides these at runtime.
+
+    resources:
+      Per-component CPU/memory requests and limits:
+        keycloak: 500m/1Gi req → 2000m/2Gi limit
+        microservices (api-gateway, user/product/order-service): 200m/512Mi → 800m/1Gi
+        configServer: 150m/384Mi → 500m/512Mi
+        postgres: 100m/256Mi → 500m/512Mi
+        frontend: 50m/64Mi → 200m/128Mi
+        otelCollector: 100m/128Mi → 300m/256Mi
+        prometheus: 200m/512Mi → 1000m/2Gi
+        loki: 100m/256Mi → 500m/512Mi
+        tempo: 100m/256Mi → 500m/512Mi
+        grafana: 100m/256Mi → 500m/512Mi
+
+    autoscaling:
+      enabled: true — wraps all HPA resources in {{- if .Values.autoscaling.enabled }}.
+      microservices: minReplicas=1, maxReplicas=4, cpuUtilization=70, memoryUtilization=80.
+      frontend: minReplicas=2, maxReplicas=6, cpuUtilization=70.
+
+    podDisruptionBudget:
+      enabled: true — wraps all PDB resources.
+      minAvailable: 1.
+
+    keycloak:
+      realm: myapp-realm.
+      db.name: keycloak, db.user: keycloak.
+
+    databases:
+      userDb, productDb, orderDb — name and user for each PostgreSQL database.
+
+helm_gcp/values.secrets.yaml.example
+  PURPOSE : Template showing the structure of the secrets override file.
+  WHAT IT DOES :
+    - Documents all 9 secret keys under the secrets: key.
+    - Instructs users to base64-encode real passwords (echo -n "pass" | base64).
+    - Must be copied to values.secrets.yaml (gitignored) before deploying.
+    - Used with: helm install myapp ./helm_gcp --values values.secrets.yaml
+
+helm_gcp/.helmignore
+  PURPOSE : Excludes files from helm package / helm install file bundling.
+  EXCLUDES : values.secrets.yaml (never package secrets), .DS_Store, *.tgz,
+             .git/, .idea/, *.orig.
+
+helm_gcp/templates/_helpers.tpl
+  PURPOSE : Named template library shared across all chart templates.
+  DEFINES :
+    myapp.name        — chart name, respects .Values.nameOverride.
+    myapp.chart       — "chart-version" string for helm.sh/chart label.
+    myapp.labels      — standard 4-label block: helm.sh/chart,
+                        app.kubernetes.io/managed-by, instance, version.
+    myapp.selectorLabels — takes dict "component" + "root"; outputs
+                        app: <component> and app.kubernetes.io/instance labels.
+                        Used for both selector.matchLabels and pod template labels.
+    myapp.image       — takes dict "service" + "root"; returns full Artifact
+                        Registry image path:
+                        REGION-docker.pkg.dev/PROJECT_ID/REPO/SERVICE:TAG
+    myapp.keycloakIssuerUri — returns https://KEYCLOAK_DOMAIN/realms/myapp-realm.
+                        Must be HTTPS with the external domain because KC_PROXY=edge
+                        causes Keycloak to issue tokens with iss: https://...,
+                        so Spring Boot's JWT validation will fail with http:// URIs.
+    myapp.keycloakTokenUri  — returns http://keycloak:8080/realms/myapp-realm/...token.
+                        Internal URL used by order-service for client_credentials token
+                        fetch. Avoids public LB round-trip for machine-to-machine auth.
+    myapp.configServerUri   — returns http://configuser:$(CONFIG_SERVER_PASSWORD)@
+                        config-server:8888. Uses Kubernetes env var substitution
+                        syntax ($(VAR)) not Helm; rendered as a literal string.
+
+helm_gcp/templates/NOTES.txt
+  PURPOSE : Displayed to the user in the terminal immediately after helm install.
+  CONTAINS :
+    - URLs for all three public endpoints (app, keycloak, grafana).
+    - Static IP retrieval command.
+    - DNS A record setup instructions.
+    - ManagedCertificate status check command.
+    - Pod monitoring command.
+    - Credentials (Keycloak admin, Grafana admin, test users).
+    - Next steps: import realm, create test users.
+
+helm_gcp/templates/namespace.yaml
+  PURPOSE : Creates the myapp Kubernetes namespace.
+  WHAT IT DOES :
+    - Uses {{ .Release.Namespace }} so the namespace matches whatever -n flag
+      is passed to helm install (defaults to myapp).
+    - Labels with standard myapp.labels.
+
+helm_gcp/templates/secrets.yaml
+  PURPOSE : Creates all 8 Kubernetes Secret objects needed by the stack.
+  SECRETS CREATED :
+    keycloak-db-secret    → KC_DB_PASSWORD
+    keycloak-admin-secret → KEYCLOAK_ADMIN, KEYCLOAK_ADMIN_PASSWORD
+    user-db-secret        → USER_DB_PASSWORD
+    product-db-secret     → PRODUCT_DB_PASSWORD
+    order-db-secret       → ORDER_DB_PASSWORD
+    order-client-secret   → ORDER_SERVICE_CLIENT_SECRET
+    config-server-secret  → CONFIG_SERVER_PASSWORD
+    grafana-secret        → GF_SECURITY_ADMIN_PASSWORD
+  VALUES : All sourced from .Values.secrets.* (base64-encoded, passed via
+    values.secrets.yaml override).
+
+helm_gcp/templates/configmaps/config-repo-cm.yaml
+  PURPOSE : Embeds the Spring Cloud Config native source files.
+  WHAT IT DOES :
+    - Single ConfigMap named config-repo containing all *.yml files from
+      config-repo/ as data keys.
+    - Mounted at /config-repo in the config-server container.
+    - File names must match spring.application.name values exactly.
+    - Includes: application.yml (shared), user-service.yml, product-service.yml,
+      order-service.yml, api-gateway.yml.
+
+helm_gcp/templates/configmaps/keycloak-realm-cm.yaml
+  PURPOSE : Provides the Keycloak realm JSON for auto-import on startup.
+  GCP-SPECIFIC DIFFERENCES from the local k8s/ version:
+    - sslRequired: "external" — Keycloak enforces HTTPS for external requests.
+    - redirectUris: ["https://{{ .Values.domain.app }}/*"] — uses Helm value so
+      the actual public domain is baked in at helm install time.
+    - webOrigins: ["https://{{ .Values.domain.app }}"] — same domain for CORS.
+    - realm name: {{ .Values.keycloak.realm | quote }} — driven from values.
+
+helm_gcp/templates/configmaps/infra-configs-cm.yaml
+  PURPOSE : Provides configuration files for all observability components.
+  CONFIGMAPS :
+    prometheus-config  — prometheus.yml scraping all Spring Boot /actuator/prometheus
+                         endpoints plus OTel Collector metrics on port 8888.
+    otel-collector-config — OTel Collector pipeline: OTLP receivers (4317/4318),
+                         Prometheus exporter (8888), Loki exporter, Tempo exporter.
+    loki-config        — Loki single-process mode, filesystem storage at /loki.
+    tempo-config       — Tempo with OTLP receiver and local storage at /var/tempo.
+    grafana-datasources — Grafana provisioning YAML wiring Prometheus, Loki, Tempo.
+    nginx-config       — nginx server block for the Angular SPA: serves /index.html
+                         for all routes (SPA fallback), proxies /api/ to api-gateway.
+
+helm_gcp/templates/storage/pvcs.yaml
+  PURPOSE : Creates 8 PersistentVolumeClaims for stateful workloads.
+  PVCS :
+    postgres-keycloak-pvc  {{ .Values.storage.sizes.postgresKeycloak }}
+    postgres-user-pvc      {{ .Values.storage.sizes.postgresUser }}
+    postgres-product-pvc   {{ .Values.storage.sizes.postgresProduct }}
+    postgres-order-pvc     {{ .Values.storage.sizes.postgresOrder }}
+    prometheus-pvc         {{ .Values.storage.sizes.prometheus }}
+    loki-pvc               {{ .Values.storage.sizes.loki }}
+    tempo-pvc              {{ .Values.storage.sizes.tempo }}
+    grafana-pvc            {{ .Values.storage.sizes.grafana }}
+  STORAGE CLASS : {{ .Values.storage.class }} — defaults to standard-rwo (GKE pd-standard).
+
+helm_gcp/templates/databases/postgres-keycloak.yaml
+helm_gcp/templates/databases/postgres-user.yaml
+helm_gcp/templates/databases/postgres-product.yaml
+helm_gcp/templates/databases/postgres-order.yaml
+  PURPOSE : Deploys a dedicated PostgreSQL 16-alpine StatefulSet for each service.
+  WHAT THEY DO :
+    - StatefulSet (not Deployment) for stable pod identity and ordered rollout.
+    - Headless Service (clusterIP: None) for stable DNS: postgres-keycloak.myapp.svc,
+      postgres-user.myapp.svc, etc.
+    - Environment variables: POSTGRES_DB, POSTGRES_USER from .Values.databases.*,
+      POSTGRES_PASSWORD from secretKeyRef.
+    - PVC mounted at /var/lib/postgresql/data.
+    - Resources from {{- toYaml .Values.resources.postgres | nindent 12 }}.
+    - readinessProbe: pg_isready -U <user>.
+
+helm_gcp/templates/auth/keycloak.yaml
+  PURPOSE : Deploys Keycloak 24.0.4 in production mode on GKE.
+  GCP-SPECIFIC ENV VARS :
+    KC_HOSTNAME         — set to {{ .Values.domain.keycloak }} (external FQDN).
+                          Causes Keycloak to embed https://KEYCLOAK_DOMAIN in JWT iss claim.
+    KC_PROXY            — edge: tells Keycloak it's behind an SSL-terminating proxy (GCP LB).
+    KC_HOSTNAME_STRICT  — false: allows health check requests from any hostname.
+    KC_HTTP_ENABLED     — true: Keycloak listens on HTTP internally (GCP LB does TLS).
+  SERVICE TYPE : NodePort with annotation
+    cloud.google.com/backend-config: '{"default": "keycloak-backend-config"}'
+    Required for GKE Ingress LB to use the custom health check path /health/ready.
+  INIT CONTAINER : Imports the realm from keycloak-realm-cm ConfigMap at startup.
+  RESOURCES : {{- toYaml .Values.resources.keycloak | nindent 12 }}
+
+helm_gcp/templates/spring-cloud/config-server.yaml
+  PURPOSE : Deploys the Spring Cloud Config Server.
+  WHAT IT DOES :
+    - Image: {{ include "myapp.image" (dict "service" "config-server" "root" .) }}
+      resolves to Artifact Registry path.
+    - Mounts config-repo ConfigMap at /config-repo.
+    - CONFIG_SERVER_PASSWORD from config-server-secret.
+    - Service type: ClusterIP (not exposed externally).
+    - readinessProbe: GET /actuator/health on port 8888.
+
+helm_gcp/templates/spring-cloud/api-gateway.yaml
+  PURPOSE : Deploys Spring Cloud Gateway — the single external entry point.
+  WHAT IT DOES :
+    - KEYCLOAK_ISSUER_URI: {{ include "myapp.keycloakIssuerUri" . }}
+      External HTTPS URI required for JWT validation against Keycloak's JWKS.
+    - SPRING_CLOUD_CONFIG_URI: {{ include "myapp.configServerUri" . }}
+      Uses Kubernetes env var substitution ($(CONFIG_SERVER_PASSWORD)) for credentials.
+    - OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317 for distributed tracing.
+    - initContainers wait for config-server and keycloak readiness.
+    - Service type: NodePort with cloud.google.com/backend-config annotation
+      (api-gateway-backend-config uses /actuator/health:8090 as health check path).
+
+helm_gcp/templates/microservices/user-service.yaml
+  PURPOSE : Deploys the User Service (port 8081).
+  WHAT IT DOES :
+    - KEYCLOAK_ISSUER_URI: external HTTPS URI ({{ include "myapp.keycloakIssuerUri" . }}).
+    - SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-user:5432/{{ .Values.databases.userDb.name }}
+    - initContainers wait for postgres-user and config-server.
+    - Service type: ClusterIP (internal only — accessed via api-gateway).
+
+helm_gcp/templates/microservices/product-service.yaml
+  PURPOSE : Deploys the Product Service (port 8082).
+  WHAT IT DOES :
+    - Same pattern as user-service.
+    - SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-product:5432/{{ .Values.databases.productDb.name }}
+    - initContainers wait for postgres-product and config-server.
+    - Service type: ClusterIP.
+
+helm_gcp/templates/microservices/order-service.yaml
+  PURPOSE : Deploys the Order Service (port 8083).
+  TWO KEYCLOAK URLS (critical distinction):
+    KEYCLOAK_ISSUER_URI  — {{ include "myapp.keycloakIssuerUri" . }}
+                           External HTTPS URL. Spring Boot uses this to fetch
+                           Keycloak's JWKS and validate JWT iss claim.
+    KEYCLOAK_TOKEN_URI   — {{ include "myapp.keycloakTokenUri" . }}
+                           Internal http://keycloak:8080/... URL. order-service
+                           uses this for OAuth2 client_credentials token fetch to
+                           avoid public LB round-trip for machine-to-machine auth.
+  OTHER ENV VARS :
+    USER_SERVICE_URL, PRODUCT_SERVICE_URL — internal ClusterIP service addresses.
+    ORDER_SERVICE_CLIENT_SECRET — from order-client-secret.
+  SERVICE TYPE : ClusterIP.
+
+helm_gcp/templates/observability/otel-collector.yaml
+  PURPOSE : Deploys the OpenTelemetry Collector.
+  WHAT IT DOES :
+    - Image: otel/opentelemetry-collector-contrib:latest
+    - Receives traces/metrics via OTLP gRPC (4317) and OTLP HTTP (4318).
+    - Exposes Prometheus scrape endpoint on port 8888 for its own metrics.
+    - Mounts otel-collector-config ConfigMap at /etc/otel.
+    - readinessProbe: GET / on port 13133 (OTel Collector's health check extension).
+    - Resources: {{- toYaml .Values.resources.otelCollector | nindent 12 }}
+    - Service type: ClusterIP.
+
+helm_gcp/templates/observability/prometheus.yaml
+  PURPOSE : Deploys Prometheus time-series metrics database.
+  WHAT IT DOES :
+    - Image: prom/prometheus:latest
+    - Args: --config.file, --storage.tsdb.path=/prometheus,
+            --web.enable-lifecycle (hot-reload), --web.enable-remote-write-receiver.
+    - securityContext: runAsUser=65534 (nobody UID), runAsNonRoot=true.
+    - Mounts prometheus-config ConfigMap at /etc/prometheus.
+    - Mounts prometheus-pvc at /prometheus for time-series data persistence.
+    - readinessProbe: GET /-/ready on port 9090.
+    - livenessProbe: GET /-/healthy on port 9090.
+    - Resources: {{- toYaml .Values.resources.prometheus | nindent 12 }}
+    - Service type: ClusterIP.
+
+helm_gcp/templates/observability/loki.yaml
+  PURPOSE : Deploys Grafana Loki log aggregation.
+  WHAT IT DOES :
+    - Image: grafana/loki:3.0.0 (pinned version matching CLAUDE.md).
+    - securityContext: runAsUser=10001, runAsNonRoot=true.
+    - Mounts loki-config ConfigMap at /etc/loki.
+    - Mounts loki-pvc at /loki for log chunk persistence.
+    - readinessProbe and livenessProbe: GET /ready on port 3100.
+    - Resources: {{- toYaml .Values.resources.loki | nindent 12 }}
+    - Service type: ClusterIP.
+
+helm_gcp/templates/observability/tempo.yaml
+  PURPOSE : Deploys Grafana Tempo distributed trace storage.
+  WHAT IT DOES :
+    - Image: grafana/tempo:latest
+    - securityContext: runAsUser=10001, runAsNonRoot=true.
+    - Args: -config.file=/etc/tempo.yaml (loaded via subPath ConfigMap mount).
+    - Ports: 3100 (HTTP query), 4317 (OTLP gRPC), 4318 (OTLP HTTP).
+    - Mounts tempo-config ConfigMap key tempo.yaml at /etc/tempo.yaml via subPath.
+    - Mounts tempo-pvc at /var/tempo for trace storage.
+    - Resources: {{- toYaml .Values.resources.tempo | nindent 12 }}
+    - Service type: ClusterIP with named ports (http, otlp-grpc, otlp-http).
+
+helm_gcp/templates/observability/grafana.yaml
+  PURPOSE : Deploys Grafana 11.0.0 dashboard and visualization.
+  GCP-SPECIFIC ENV VAR :
+    GF_SERVER_ROOT_URL — https://{{ .Values.domain.grafana }}
+    Tells Grafana its externally visible URL for share links, OAuth redirects,
+    and email alerts; must match the domain behind the GCP LB.
+  OTHER ENV VARS :
+    GF_SECURITY_ADMIN_USER: admin
+    GF_SECURITY_ADMIN_PASSWORD: from grafana-secret
+    GF_USERS_ALLOW_SIGN_UP: "false"
+    GF_FEATURE_TOGGLES_ENABLE: traceqlEditor (enables TraceQL for Tempo)
+  securityContext : runAsUser=472, runAsNonRoot=true (Grafana's dedicated UID).
+  MOUNTS : grafana-datasources ConfigMap at /etc/grafana/provisioning/datasources,
+           grafana-pvc at /var/lib/grafana.
+  SERVICE TYPE : NodePort with cloud.google.com/backend-config annotation
+    (grafana-backend-config uses /api/health:3000 as health check path).
+
+helm_gcp/templates/frontend/frontend.yaml
+  PURPOSE : Deploys the Angular 17 SPA served by nginx.
+  GCP NOTE (embedded as YAML comment):
+    The Angular image must be built with the production config that bakes in
+    environment.prod.ts. Update keycloakUrl: 'https://{{ .Values.domain.keycloak }}'
+    in frontend/src/environments/environment.prod.ts before building.
+  WHAT IT DOES :
+    - Image: {{ include "myapp.image" (dict "service" "frontend" "root" .) }}
+    - Mounts nginx-config ConfigMap at /etc/nginx/conf.d.
+    - readinessProbe / livenessProbe: GET /index.html on port 80.
+    - Replicas: {{ .Values.replicas.frontend }} (default 2 for HA).
+    - Resources: {{- toYaml .Values.resources.frontend | nindent 12 }}
+  SERVICE TYPE : NodePort with cloud.google.com/backend-config annotation
+    (frontend-backend-config uses /index.html:80 as health check path).
+
+helm_gcp/templates/ingress/backend-configs.yaml
+  PURPOSE : Defines GCP-specific health check behavior per backend service.
+  WHY NEEDED : The Google Cloud HTTP(S) LB uses GET / on the node port by default,
+    which returns 4xx for Spring Boot (no route at /) and 302 for Keycloak (login redirect).
+    BackendConfig CRDs override this per backend.
+  FOUR BackendConfigs :
+    frontend-backend-config   — requestPath: /index.html, port: 80, timeout: 30s
+    api-gateway-backend-config— requestPath: /actuator/health, port: 8090, timeout: 60s
+    keycloak-backend-config   — requestPath: /health/ready, port: 8080, timeout: 60s,
+                                unhealthyThreshold: 5 (Keycloak is slow to start)
+    grafana-backend-config    — requestPath: /api/health, port: 3000, timeout: 30s
+  All include connectionDraining.drainingTimeoutSec: 60 for graceful pod shutdown.
+
+helm_gcp/templates/ingress/frontend-config.yaml
+  PURPOSE : Enforces HTTP→HTTPS redirect at the Google Cloud LB level.
+  WHAT IT DOES :
+    - apiVersion: networking.gke.io/v1beta1, kind: FrontendConfig.
+    - spec.redirectToHttps.enabled: true, responseCodeName: MOVED_PERMANENTLY_DEFAULT (301).
+    - Applied to the Ingress via annotation:
+      networking.gke.io/v1beta1.FrontendConfig: "myapp-frontend-config"
+    - This redirect happens at the LB (before the request reaches any pod),
+      ensuring all HTTP traffic is upgraded without any application code changes.
+
+helm_gcp/templates/ingress/managed-certs.yaml
+  PURPOSE : Provisions Google-managed TLS certificates for all three public domains.
+  WHAT IT DOES :
+    - apiVersion: networking.gke.io/v1, kind: ManagedCertificate.
+    - Domains: {{ .Values.domain.app }}, {{ .Values.domain.keycloak }}, {{ .Values.domain.grafana }}.
+    - Google's Certificate Manager automatically provisions and renews certs once
+      DNS A records for all listed domains point to the reserved static IP.
+    - Certificate status: Provisioning → Active (up to 60 minutes after DNS resolves).
+    - Referenced in Ingress via:
+      networking.gke.io/managed-certificates: "myapp-cert"
+
+helm_gcp/templates/ingress/ingress.yaml
+  PURPOSE : Creates the GKE native Ingress which provisions a Google Cloud HTTP(S) LB.
+  ANNOTATIONS :
+    kubernetes.io/ingress.class: "gce"
+      Forces use of the GKE native Ingress controller (Google Cloud LB).
+    kubernetes.io/ingress.global-static-ip-name: {{ .Values.gcp.staticIpName }}
+      Binds the LB to the pre-reserved global static IP.
+    networking.gke.io/managed-certificates: "myapp-cert"
+      Attaches the ManagedCertificate for automatic TLS.
+    networking.gke.io/v1beta1.FrontendConfig: "myapp-frontend-config"
+      Applies HTTP→HTTPS redirect from FrontendConfig.
+  PATH ROUTING :
+    {{ .Values.domain.app }}/api   → api-gateway:8090   (Prefix match — all /api/* requests)
+    {{ .Values.domain.app }}/      → frontend:80         (Prefix match — SPA, nginx handles routing)
+    {{ .Values.domain.keycloak }}/ → keycloak:8080       (All Keycloak paths: /auth, /realms, etc.)
+    {{ .Values.domain.grafana }}/  → grafana:3000        (All Grafana paths)
+  IMPORTANT : No rewrite-target annotation. Adding rewrite-target: / would strip
+    the path from proxied requests, breaking all API and Keycloak endpoints.
+
+helm_gcp/templates/scaling/hpa.yaml
+  PURPOSE : Horizontal autoscaling for all stateless services.
+  CONDITIONAL : Wrapped in {{- if .Values.autoscaling.enabled }} so HPAs can be
+    disabled by setting autoscaling.enabled: false in values.
+  FIVE HPAs (autoscaling/v2):
+    api-gateway-hpa    — minReplicas/maxReplicas from .Values.autoscaling.microservices
+    user-service-hpa   — same
+    product-service-hpa— same
+    order-service-hpa  — same
+    frontend-hpa       — minReplicas/maxReplicas from .Values.autoscaling.frontend
+  METRICS : CPU utilization (target: cpuUtilization%) + Memory utilization
+    (target: memoryUtilization%) for microservices. CPU only for frontend.
+  PREREQUISITE : GKE Metrics Server must be running (enabled by default).
+    Verify: kubectl top pods -n myapp
+
+helm_gcp/templates/scaling/pdb.yaml
+  PURPOSE : Protects service availability during voluntary disruptions
+    (node upgrades, cluster maintenance, pod evictions).
+  CONDITIONAL : Wrapped in {{- if .Values.podDisruptionBudget.enabled }}.
+  SEVEN PDBs (policy/v1):
+    api-gateway-pdb, user-service-pdb, product-service-pdb, order-service-pdb,
+    keycloak-pdb, frontend-pdb, config-server-pdb.
+  BEHAVIOR : minAvailable: {{ .Values.podDisruptionBudget.minAvailable }} (default 1).
+    Kubernetes will not evict a pod if doing so would bring the number of available
+    pods below this threshold.
+  SELECTOR : Uses myapp.selectorLabels helper to match the same app: <component> label
+    as each Deployment's pod template.
+
+helm_gcp/scripts/install.sh
+  PURPOSE : First-time Helm install onto GKE.
+  WHAT IT DOES :
+    1. Fetches GKE cluster credentials (gcloud container clusters get-credentials).
+    2. Verifies kubectl context is correct.
+    3. Validates that values.secrets.yaml exists (exits with clear error if not).
+    4. Runs helm lint to catch template errors before applying.
+    5. Runs helm install with:
+       --namespace myapp --create-namespace (creates namespace if absent)
+       --values values.secrets.yaml
+       --timeout 15m --wait --atomic
+       (atomic: auto-rollback if any resource fails to become ready within timeout)
+    6. Prints static IP and DNS setup instructions after install.
+  CONFIGURATION : Edit PROJECT_ID, REGION, CLUSTER_NAME at the top of the script.
+
+helm_gcp/scripts/upgrade.sh
+  PURPOSE : Upgrades an existing Helm release after image pushes or value changes.
+  WHAT IT DOES :
+    1. Fetches cluster credentials.
+    2. Validates secrets file.
+    3. Runs helm lint.
+    4. Runs helm upgrade with --atomic --cleanup-on-fail (removes newly created
+       resources if the upgrade fails, enabling clean rollback).
+    5. Prints helm history (last 5 releases) and pod status.
+    6. Shows rollback command for quick reference.
+  PARTIAL UPGRADE EXAMPLE (no script needed):
+    helm upgrade myapp . --reuse-values --set image.tag=1.1.0
+
+helm_gcp/scripts/uninstall.sh
+  PURPOSE : Removes the Helm release from GKE.
+  MODES :
+    bash scripts/uninstall.sh            — removes all Helm-managed resources;
+                                           preserves all PVCs (data is safe).
+    bash scripts/uninstall.sh --purge-pvcs — also deletes all PVCs after
+                                           interactive confirmation; IRREVERSIBLE.
+  NOTE : The script does NOT delete the GKE cluster, static IP, or Artifact
+    Registry. These are long-lived GCP resources; commands to remove them are
+    printed at the end for reference.
+
+=====================================================================
+GCP HELM DEPLOYMENT GUIDE — STEP BY STEP
+=====================================================================
+
+PHASE 0 — Prerequisites
+------------------------
+Install on your local machine:
+  - Google Cloud SDK:  gcloud --version  (>= 400.0.0)
+  - kubectl:           kubectl version --client
+  - Helm 3:            helm version --short  (>= 3.12.0)
+  - Docker:            docker --version
+
+Authenticate with GCP:
+  gcloud auth login
+  gcloud auth application-default login
+
+PHASE 1 — Edit Configuration Files
+------------------------------------
+1a. Update helm_gcp/values.yaml with your real values:
+    gcp:
+      region: us-central1          # your preferred GCP region
+      projectId: my-gcp-project    # your GCP project ID
+    domain:
+      app:      app.example.com
+      keycloak: keycloak.example.com
+      grafana:  grafana.example.com
+
+1b. Update the Angular production environment:
+    Edit frontend/src/environments/environment.prod.ts:
+      keycloakUrl: 'https://keycloak.example.com'    # your Keycloak domain
+    This value is baked into the Angular bundle at build time.
+    It cannot be changed without rebuilding the image.
+
+1c. Create secrets override file:
+    cp helm_gcp/values.secrets.yaml.example helm_gcp/values.secrets.yaml
+    Edit values.secrets.yaml — replace all placeholder base64 values:
+      echo -n "your-secure-password" | base64
+    Add to .gitignore:
+      echo "helm_gcp/values.secrets.yaml" >> .gitignore
+
+PHASE 2 — Provision GCP Infrastructure (run once)
+---------------------------------------------------
+Edit PROJECT_ID, REGION, etc. at the top of the script, then:
+
+  bash k8s_gcp/scripts/00-setup-gcp.sh
+
+This script:
+  - Enables required GCP APIs (container, artifactregistry, compute, etc.)
+  - Creates an Artifact Registry repository named "myapp"
+  - Creates a GKE Standard cluster with cluster autoscaling (2–6 nodes)
+  - Reserves a global static IP named "myapp-static-ip"
+  - Fetches cluster credentials into kubeconfig
+  - Prints the static IP address
+
+Note: The same k8s_gcp/scripts/00-setup-gcp.sh script works for both the
+raw kubectl (k8s_gcp/) and Helm (helm_gcp/) deployment paths since they
+share the same GCP infrastructure.
+
+PHASE 3 — Build and Push Docker Images
+----------------------------------------
+Edit PROJECT_ID, REGION at the top of the script, then:
+
+  bash k8s_gcp/scripts/01-build-push.sh
+
+This script builds 6 images (--platform linux/amd64) and pushes to AR:
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/config-server:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/api-gateway:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/user-service:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/product-service:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/order-service:1.0.0
+  REGION-docker.pkg.dev/PROJECT_ID/myapp/frontend:1.0.0
+
+Note: The build-push script is also shared with the k8s_gcp deployment path.
+
+PHASE 4 — Configure DNS
+------------------------
+Get the reserved static IP:
+  gcloud compute addresses describe myapp-static-ip --global \
+    --format="get(address)"
+
+In your DNS provider, create A records:
+  app.example.com       →  <STATIC_IP>
+  keycloak.example.com  →  <STATIC_IP>
+  grafana.example.com   →  <STATIC_IP>
+
+DNS propagation can take 5–60 minutes. The ManagedCertificate will not
+provision until all three domains resolve to the static IP.
+
+PHASE 5 — Install the Helm Chart
+----------------------------------
+Edit PROJECT_ID, REGION, CLUSTER_NAME at the top of install.sh, then:
+
+  cd helm_gcp
+  bash scripts/install.sh
+
+What install.sh does:
+  - Fetches cluster credentials
+  - Validates values.secrets.yaml exists
+  - Runs helm lint (fails fast on template errors)
+  - Runs helm install --namespace myapp --create-namespace --atomic --wait
+    (Helm waits up to 15m for all pods to become ready; rolls back on failure)
+  - Prints DNS instructions and cert status command
+
+Alternatively, install manually:
+  gcloud container clusters get-credentials myapp-cluster \
+    --region us-central1 --project PROJECT_ID
+
+  helm lint helm_gcp/ --values helm_gcp/values.secrets.yaml
+
+  helm install myapp helm_gcp/ \
+    --namespace myapp \
+    --create-namespace \
+    --values helm_gcp/values.secrets.yaml \
+    --timeout 15m \
+    --wait \
+    --atomic
+
+Monitor startup:
+  kubectl get pods -n myapp -w
+  kubectl get events -n myapp --sort-by='.lastTimestamp'
+
+PHASE 6 — Wait for ManagedCertificate
+---------------------------------------
+  kubectl describe managedcertificate myapp-cert -n myapp
+
+Status field: Provisioning → Active (up to 60 minutes after DNS resolves).
+The site will show a certificate error until status is Active.
+The GKE Ingress object shows events about LB provisioning:
+  kubectl describe ingress myapp-ingress -n myapp
+
+PHASE 7 — Import Keycloak Realm and Create Test Users
+------------------------------------------------------
+The Keycloak realm is auto-imported from the ConfigMap on first startup.
+Verify import:
+  kubectl logs -n myapp -l app=keycloak | grep "Import of realm"
+
+Access Keycloak Admin Console:
+  https://keycloak.example.com/admin
+  Username: admin    Password: (from values.secrets.yaml keycloakAdminPassword)
+
+Verify:
+  - Realm "myapp-realm" exists
+  - Client "angular-client" exists (public, PKCE enabled)
+  - Client "order-service-client" exists (confidential, serviceAccountsEnabled)
+  - Protocol mappers on both clients include the "roles" claim mapper
+
+Create test users (if not in realm export):
+  1. Go to myapp-realm → Users → Add User
+  2. Username: user1   Email: user1@example.com
+  3. Credentials tab → Set Password: User@1234!  (temporary: off)
+  4. Role Mappings tab → Realm Roles → assign ROLE_USER
+  5. Repeat for admin1 with both ROLE_USER and ROLE_ADMIN
+
+PHASE 8 — Access the Application
+----------------------------------
+  Angular App:  https://app.example.com
+  API Gateway:  https://app.example.com/api
+  Keycloak:     https://keycloak.example.com/admin
+  Grafana:      https://grafana.example.com  (admin / grafana_pass)
+  Prometheus:   Internal only — kubectl port-forward svc/prometheus 9090:9090 -n myapp
+
+PHASE 9 — Upgrading
+---------------------
+After pushing a new image tag or changing values:
+
+  # Build and push new images (example: tag 1.1.0)
+  # Edit IMAGE_TAG in 01-build-push.sh → 1.1.0, then:
+  bash k8s_gcp/scripts/01-build-push.sh
+
+  # Upgrade with new image tag
+  cd helm_gcp
+  bash scripts/upgrade.sh
+  # Or: helm upgrade myapp . --reuse-values --set image.tag=1.1.0
+
+  # View release history
+  helm history myapp --namespace myapp
+
+  # Roll back to previous release if needed
+  helm rollback myapp --namespace myapp
+
+PHASE 10 — Monitoring and Debugging
+-------------------------------------
+  # Check all pod status
+  kubectl get pods -n myapp
+
+  # Follow logs for a specific pod
+  kubectl logs -n myapp -l app=order-service -f
+
+  # Describe a failing pod (shows events, resource limits, etc.)
+  kubectl describe pod <pod-name> -n myapp
+
+  # Check HPA status (scale-out activity)
+  kubectl get hpa -n myapp
+
+  # Check PDB status (disruption budget)
+  kubectl get pdb -n myapp
+
+  # Port-forward Prometheus for direct query access
+  kubectl port-forward svc/prometheus 9090:9090 -n myapp
+
+  # Port-forward Grafana if Ingress cert is pending
+  kubectl port-forward svc/grafana 3000:3000 -n myapp
+
+PHASE 11 — Uninstall
+---------------------
+  # Remove all Helm-managed resources; keep PVCs (database data preserved)
+  cd helm_gcp
+  bash scripts/uninstall.sh
+
+  # Remove all resources including PVCs (IRREVERSIBLE — all data lost)
+  bash scripts/uninstall.sh --purge-pvcs
+
+  # Delete GCP infrastructure (cluster, static IP, Artifact Registry)
+  gcloud container clusters delete myapp-cluster --region=REGION
+  gcloud compute addresses delete myapp-static-ip --global
+  gcloud artifacts repositories delete myapp --location=REGION
+
+HELM TIPS
+---------
+  # Dry-run: preview all generated manifests without applying
+  helm install myapp helm_gcp/ --dry-run --debug \
+    --values helm_gcp/values.secrets.yaml
+
+  # Template: render templates locally without a cluster
+  helm template myapp helm_gcp/ \
+    --values helm_gcp/values.secrets.yaml \
+    --namespace myapp
+
+  # Lint: validate templates and values schema
+  helm lint helm_gcp/ --values helm_gcp/values.secrets.yaml
+
+  # Diff (requires helm-diff plugin):
+  helm plugin install https://github.com/databus23/helm-diff
+  helm diff upgrade myapp helm_gcp/ --values helm_gcp/values.secrets.yaml
+
+  # Package chart for distribution
+  helm package helm_gcp/
+
+  # Override a single value without editing files
+  helm upgrade myapp helm_gcp/ --reuse-values \
+    --set replicas.orderService=3
+
+  # Override storage class for SSD (higher IOPS)
+  helm upgrade myapp helm_gcp/ --reuse-values \
+    --set storage.class=premium-rwo
+
+KNOWN GCP-SPECIFIC GOTCHAS
+---------------------------
+1. JWT Issuer Mismatch
+   KC_PROXY=edge + KC_HOSTNAME=keycloak.example.com causes Keycloak to put
+   https://keycloak.example.com/realms/myapp-realm in the JWT iss claim.
+   KEYCLOAK_ISSUER_URI in ALL Spring Boot services must match this exactly.
+   The myapp.keycloakIssuerUri helper always returns the correct HTTPS URI.
+
+2. BackendConfig Required for Health Checks
+   Without BackendConfig CRDs, the GCP LB probes GET / on the node port.
+   Spring Boot returns 404 at /, Keycloak returns 302 (login redirect).
+   Both cause the LB to mark the backend as unhealthy and drop traffic.
+
+3. No rewrite-target on the Ingress
+   Adding nginx.ingress.kubernetes.io/rewrite-target: / would strip the path
+   prefix from all proxied requests, breaking /api, /realms, and /grafana routes.
+   The GKE native Ingress does NOT use nginx annotations — do not add them.
+
+4. CONFIG_SERVER_PASSWORD Must Be Defined Before SPRING_CLOUD_CONFIG_URI
+   Kubernetes $(VAR) substitution only resolves variables defined earlier in
+   the env list. The configServerUri helper embeds $(CONFIG_SERVER_PASSWORD)
+   in the URI. In all Deployment templates the CONFIG_SERVER_PASSWORD env var
+   appears before SPRING_CLOUD_CONFIG_URI — do not reorder them.
+
+5. ManagedCertificate Provisioning Time
+   Certificates can take up to 60 minutes to provision after DNS resolves.
+   During this time HTTPS connections will show a certificate error.
+   Use kubectl port-forward to access services while waiting.
+
+6. Angular Keycloak URL Is Baked In at Build Time
+   environment.prod.ts is compiled into the Angular bundle during docker build.
+   If you change the Keycloak domain after building, you must rebuild the image.
+   Always update environment.prod.ts before running 01-build-push.sh.
+
+7. PVCs Are Not Deleted by helm uninstall
+   This is intentional to protect database data across chart upgrades.
+   Use --purge-pvcs flag with uninstall.sh only when doing a full teardown.
+
+8. GKE Ingress Requires NodePort Services
+   The Google Cloud LB communicates with pods via node ports, not ClusterIP.
+   Services exposed through the Ingress (frontend, api-gateway, keycloak,
+   grafana) are type: NodePort. Internal services remain type: ClusterIP.
+
+=====================================================================
+  KEYCLOAK REALM EXPORT — FULL REFERENCE
+  File: infrastructure/keycloak/realm-export.json
+=====================================================================
+
+  This section provides a complete, field-by-field reference for the
+  Keycloak realm export file. This JSON file is the single source of
+  truth for the entire Keycloak security configuration. Keycloak reads
+  it at first startup via the --import-realm flag and sets up the realm,
+  roles, clients, users, and token mappings automatically — no manual
+  Keycloak Admin Console steps are required.
+
+  The export is also the canonical record of what tokens look like and
+  why: every JWT claim, every grant type decision, and every session
+  timeout can be traced back to a field in this file.
+
+---------------------------------------------------------------------
+  1. REALM-LEVEL SETTINGS
+---------------------------------------------------------------------
+
+  realm                  : "myapp-realm"
+    The internal name of the realm. All Keycloak endpoints are prefixed
+    with this name (e.g. /realms/myapp-realm/protocol/openid-connect/token).
+    Must match the KEYCLOAK_ISSUER_URI configured in every Spring Boot
+    service and the realm value in the Angular Keycloak initializer.
+
+  displayName            : "MyApp Realm"
+    Human-readable label shown on the Keycloak login screen header.
+
+  enabled                : true
+    The realm is active. Setting this to false would block all logins
+    without deleting any data.
+
+  sslRequired            : "none"
+    Disables Keycloak's built-in SSL enforcement. Suitable for local
+    development and Docker Compose where all traffic is on localhost.
+    PRODUCTION WARNING: change to "external" (enforce HTTPS for external
+    requests) or "all" (enforce HTTPS for all requests including internal)
+    before deploying to any internet-facing environment.
+
+  registrationAllowed    : false
+    Self-registration via the login page is disabled. New accounts can
+    only be created by an administrator via the Admin Console, Admin REST
+    API, or by adding users to this export file.
+
+  loginWithEmailAllowed  : true
+    Users can authenticate using their email address in addition to their
+    username. Both "user1" and "user1@myapp.com" would work as the login
+    identifier.
+
+  duplicateEmailsAllowed : false
+    Enforces email uniqueness across the realm. Attempting to create two
+    accounts with the same email is rejected.
+
+  resetPasswordAllowed   : true
+    Enables the "Forgot password?" link on the login screen. Keycloak
+    sends a password-reset email when a user requests it. Requires a
+    working email server to be configured in the realm SMTP settings
+    (not defined in this export — must be set in the Admin Console for
+    the reset flow to deliver mail).
+
+  editUsernameAllowed    : false
+    Once created, a user's username is immutable from the self-service
+    profile page. An administrator can still change it via the Admin API.
+
+  bruteForceProtected    : true
+    Activates Keycloak's built-in brute-force detection. After a
+    configurable number of failed login attempts the account is
+    temporarily locked. Default thresholds (30 failures, 1-minute wait,
+    permanent lock after 12 hours) apply unless overridden in the realm
+    brute-force settings. This field alone enables the feature; the
+    detailed thresholds are not stored in this export and use Keycloak
+    defaults.
+
+  accessTokenLifespan    : 300  (5 minutes)
+    How long (seconds) an access token is valid after it is issued.
+    Spring Boot services validate the exp claim on every request; a
+    token older than 5 minutes will be rejected. The Angular Keycloak
+    library silently refreshes the token before expiry using the refresh
+    token, so normal UI users are unaffected.
+
+  ssoSessionIdleTimeout  : 1800  (30 minutes)
+    A browser SSO session is destroyed if the user is idle (no token
+    refresh or interaction) for 30 minutes. After this the user must
+    log in again.
+
+  ssoSessionMaxLifespan  : 36000  (10 hours)
+    Hard ceiling on a browser SSO session regardless of activity. Even
+    an active user is forced to re-authenticate after 10 hours. This
+    bounds the window of exposure if a session token is stolen.
+
+---------------------------------------------------------------------
+  2. REALM ROLES
+---------------------------------------------------------------------
+
+  Realm roles are global to the realm and can be assigned to any user
+  or service account. This project uses two roles only.
+
+  ROLE_USER
+    description : "Standard user role"
+    composite   : false  — not built from other roles; a simple grant
+    clientRole  : false  — this is a realm role, not scoped to a client
+
+    Assigned to: user1, admin1, service-account-order-service-client
+    Grants access to: all read endpoints across user-service,
+    product-service, and order-service. Spring Security checks for the
+    ROLE_USER authority on protected GET routes.
+
+  ROLE_ADMIN
+    description : "Administrator role"
+    composite   : false
+    clientRole  : false
+
+    Assigned to: admin1, service-account-order-service-client
+    Grants access to: write endpoints (POST/PUT/DELETE) across all
+    microservices and the /admin route in the Angular frontend. Spring
+    Security checks for ROLE_ADMIN on @PreAuthorize("hasRole('ADMIN')")
+    annotated methods. The leading "ROLE_" prefix is added by the JWT
+    authorities converter in SecurityConfig.java if it is absent.
+
+  HOW ROLES REACH THE JWT:
+    The protocol mapper in each client (and the "roles" client scope)
+    reads the user's realm roles and writes them into the JWT under the
+    "roles" claim as a JSON string array. Spring Boot extracts this
+    claim with jwt.getClaimAsStringList("roles").
+
+---------------------------------------------------------------------
+  3. CLIENTS
+---------------------------------------------------------------------
+
+  Keycloak clients represent applications or services that interact with
+  the authorization server. Each has its own grant type profile, secret
+  policy, and token configuration.
+
+  ·····································
+  3.1  angular-client
+  ·····································
+
+  clientId               : "angular-client"
+  name                   : "Angular Frontend Client"
+  description            : "Public SPA client for Angular frontend"
+  enabled                : true
+  publicClient           : true
+    No client secret is used. Browser-based SPAs cannot keep a secret
+    confidential, so the public client type is the correct choice for
+    Angular. Security is provided by PKCE instead of a secret.
+
+  clientAuthenticatorType: "client-secret"
+    This field is present in the export schema but is irrelevant for a
+    public client — it is overridden by publicClient: true.
+
+  standardFlowEnabled    : true
+    Enables the Authorization Code grant. The Angular app redirects the
+    user to Keycloak's /auth endpoint, receives an authorization code,
+    and exchanges it for tokens at the /token endpoint. This is the
+    primary login flow.
+
+  implicitFlowEnabled    : false
+    The legacy Implicit flow (tokens returned directly in the redirect
+    URI fragment) is disabled. It is deprecated in OAuth2 Security BCP
+    RFC 9700 and should remain off.
+
+  directAccessGrantsEnabled : true
+    Enables the Resource Owner Password Credentials (ROPC) grant. This
+    allows a client to POST username + password directly to the /token
+    endpoint and receive tokens without a browser redirect. Enabled here
+    to support automated testing and curl-based token retrieval from the
+    command line. PRODUCTION NOTE: disable this in production to prevent
+    credential stuffing; use Authorization Code + PKCE exclusively.
+
+  serviceAccountsEnabled : false
+    This client does not have a service account — it represents a human
+    user login flow, not a machine identity.
+
+  redirectUris           : ["http://localhost:4200/*"]
+    After a successful login Keycloak will only redirect back to this
+    URI pattern. The wildcard covers any Angular route (e.g.
+    http://localhost:4200/dashboard). If the Angular app is moved to a
+    different origin this list must be updated or Keycloak will reject
+    the login with "Invalid redirect_uri".
+
+  webOrigins             : ["http://localhost:4200"]
+    Keycloak adds this origin to the Access-Control-Allow-Origin header
+    on its /token and /userinfo endpoints. Without this entry the
+    browser would block the token exchange response as a CORS violation.
+
+  attributes:
+    pkce.code.challenge.method : "S256"
+      Forces PKCE code challenge verification using SHA-256. The Angular
+      client (via keycloak-js) generates a random code_verifier, hashes
+      it with SHA-256 to produce the code_challenge, and sends the
+      challenge in the /auth request. Keycloak stores the challenge and
+      verifies the verifier when the code is exchanged at /token. This
+      prevents authorization code interception attacks.
+
+  ·····································
+  3.2  api-gateway
+  ·····································
+
+  clientId               : "api-gateway"
+  name                   : "API Gateway Client"
+  description            : "Confidential client for API Gateway"
+  enabled                : true
+  publicClient           : false
+  secret                 : "api-gateway-secret"
+    The actual secret used in Docker Compose is injected via the
+    GATEWAY_CLIENT_SECRET env var from .env; this export value is the
+    placeholder used during --import-realm.
+
+  bearerOnly             : true
+    A bearer-only client cannot initiate a login flow. It can only
+    validate Bearer tokens presented to it. The API Gateway uses this
+    client registration to verify incoming JWTs without ever redirecting
+    users itself. Keycloak will not issue tokens for this client.
+
+  standardFlowEnabled    : false
+  implicitFlowEnabled    : false
+  directAccessGrantsEnabled : false
+    All interactive flows disabled — consistent with bearer-only mode.
+
+  serviceAccountsEnabled : true
+    A service account record is created even for bearer-only clients in
+    Keycloak. In this project it is not actively used for token issuance
+    but exists as part of Keycloak's internal bookkeeping.
+
+  protocolMappers        : (none defined on the client)
+    Token claims for this client come from the default client scopes
+    (profile, email, roles, web-origins) only.
+
+  ·····································
+  3.3  order-service-client
+  ·····································
+
+  clientId               : "order-service-client"
+  name                   : "Order Service Client"
+  description            : "Confidential client for order-service
+                            machine-to-machine calls using
+                            client_credentials grant"
+  enabled                : true
+  publicClient           : false
+  secret                 : "order-service-secret"
+    Placeholder value. The real secret is ORDER_SERVICE_CLIENT_SECRET
+    from .env / k8s/01-secrets.yaml, passed as an env var to the
+    order-service container and configured in application.yml under
+    spring.security.oauth2.client.registration.keycloak.client-secret.
+
+  standardFlowEnabled    : false
+  implicitFlowEnabled    : false
+  directAccessGrantsEnabled : false
+    All human-user flows are disabled. This client is machine-only.
+
+  serviceAccountsEnabled : true
+    This is the key flag for client_credentials grant support. Enabling
+    it creates a special Keycloak user —
+    "service-account-order-service-client" — that represents the
+    order-service application itself. When order-service POSTs its
+    client_id and client_secret to the /token endpoint with
+    grant_type=client_credentials, Keycloak issues a JWT as if that
+    service account user logged in. The service account's realm roles
+    are embedded in the token.
+
+  protocolMappers:
+    realm-roles-mapper  (oidc-usermodel-realm-role-mapper)
+      Same mapper as angular-client (see Section 4). Without this mapper
+      the service account's roles would not appear in the JWT and all
+      downstream microservice calls from order-service would fail with
+      403 Forbidden.
+
+---------------------------------------------------------------------
+  4. PROTOCOL MAPPERS
+---------------------------------------------------------------------
+
+  Both angular-client and order-service-client define an identical
+  protocol mapper named "realm-roles-mapper". The "roles" client scope
+  defines an equivalent mapper named "realm roles". All three share
+  the same configuration:
+
+  protocolMapper  : "oidc-usermodel-realm-role-mapper"
+    Built-in Keycloak mapper type. Reads the realm roles assigned to
+    the authenticated user (or service account) and writes them into
+    the specified token claim.
+
+  consentRequired : false
+    The user is not shown a consent screen asking permission to include
+    roles in the token. Required consent dialogs are not appropriate for
+    a private application where the realm is controlled by the same
+    organisation as the clients.
+
+  config.multivalued       : "true"
+    The "roles" claim is a JSON array, not a single string. A user with
+    both ROLE_USER and ROLE_ADMIN will have ["ROLE_USER", "ROLE_ADMIN"].
+
+  config.userinfo.token.claim : "true"
+    Roles are also included in the /userinfo endpoint response, not
+    just in the JWT itself.
+
+  config.id.token.claim    : "true"
+    Roles are embedded in the ID token. The Angular app reads roles
+    from the access token (tokenParsed['roles']), not the ID token, but
+    including them in both makes debugging easier.
+
+  config.access.token.claim : "true"
+    Roles are embedded in the access token. This is the claim that
+    Spring Boot's SecurityConfig.java reads via
+    jwt.getClaimAsStringList("roles").
+
+  config.claim.name        : "roles"
+    The JSON key name under which roles appear in the token payload.
+    Spring Boot is configured to look for exactly this key. Changing
+    this name would break JWT validation across all microservices.
+
+  config.jsonType.label    : "String"
+    Each element in the roles array is serialized as a JSON string.
+
+  DUPLICATION WARNING:
+    Because both the client-level mapper and the "roles" client scope
+    mapper are active at the same time, Keycloak may emit the same role
+    twice in the "roles" claim (e.g., ["ROLE_USER", "ROLE_USER",
+    "ROLE_ADMIN"]). The Angular frontend deduplicates with
+    [...new Set(roles)] before checking isAdmin. Spring Boot's
+    SimpleGrantedAuthority handles duplicates harmlessly (Set semantics
+    inside GrantedAuthority collections), but the Angular app guard
+    must always deduplicate — see the Keycloak token reading pattern
+    in CLAUDE.md.
+
+---------------------------------------------------------------------
+  5. USERS
+---------------------------------------------------------------------
+
+  ·····································
+  5.1  user1  (regular user)
+  ·····································
+
+  username      : "user1"
+  email         : "user1@myapp.com"
+  firstName     : "Regular"
+  lastName      : "User"
+  enabled       : true
+  emailVerified : true
+    Marked verified so Keycloak does not show an email-verification
+    prompt on first login. In a real system this is set to true only
+    after the user clicks the verification link.
+
+  credentials:
+    type      : "password"
+    value     : "User@1234!"
+    temporary : false
+      The password is set directly in the export (plain-text in this
+      file; Keycloak hashes it on import using its configured algorithm,
+      default bcrypt). temporary: false means the user is not forced to
+      change their password at first login.
+
+  realmRoles    : ["ROLE_USER"]
+    Grants read-level access to all microservice APIs and the /users,
+    /products, /orders Angular pages.
+
+  ·····································
+  5.2  admin1  (administrator)
+  ·····································
+
+  username      : "admin1"
+  email         : "admin1@myapp.com"
+  firstName     : "Admin"
+  lastName      : "User"
+  enabled       : true
+  emailVerified : true
+
+  credentials:
+    type      : "password"
+    value     : "Admin@1234!"
+    temporary : false
+
+  realmRoles    : ["ROLE_USER", "ROLE_ADMIN"]
+    Grants full access: all read endpoints (ROLE_USER) plus all write
+    endpoints and the /admin Angular page (ROLE_ADMIN). The admin user
+    also sees all orders in the orders page and has the "Place Order"
+    button with a user-selector dropdown.
+
+  ·····································
+  5.3  service-account-order-service-client  (machine identity)
+  ·····································
+
+  username             : "service-account-order-service-client"
+    Keycloak auto-generates this username when serviceAccountsEnabled
+    is true on order-service-client. The format is always
+    "service-account-<clientId>".
+
+  enabled              : true
+  serviceAccountClientId : "order-service-client"
+    Links this user record to its owning client. Keycloak uses this
+    association to issue tokens on behalf of the client when the
+    client_credentials grant is used.
+
+  realmRoles           : ["ROLE_USER", "ROLE_ADMIN"]
+    The service account must have both roles so that when order-service
+    calls user-service or product-service, the Bearer token it carries
+    satisfies those services' @PreAuthorize checks. Without ROLE_USER
+    the calls would fail with 403.
+
+  Note: this user has no credentials block — service accounts never
+  authenticate with a password. Authentication is via the client secret
+  of order-service-client.
+
+---------------------------------------------------------------------
+  6. CLIENT SCOPES
+---------------------------------------------------------------------
+
+  Client scopes are reusable bundles of claims and mappers that can be
+  applied to multiple clients. This export defines one custom scope.
+
+  name                           : "roles"
+  description                    : "Realm and client roles scope"
+  protocol                       : "openid-connect"
+
+  attributes:
+    include.in.token.scope       : "true"
+      This scope is included in the token even when the client does not
+      explicitly request it as a scope parameter. It is always active
+      for clients where it is set as a default scope.
+
+    display.on.consent.screen    : "true"
+      If a consent screen were ever enabled this scope would appear
+      as a listed permission. Currently consent is off (see clients
+      above) so this has no visible effect.
+
+  protocolMappers:
+    "realm roles"  (oidc-usermodel-realm-role-mapper)
+      Identical configuration to the client-level mapper described in
+      Section 4. This scope-level mapper is what causes the duplication
+      warning: when this scope is active AND the client has its own
+      realm-roles-mapper, Keycloak calls both mappers and the roles
+      array receives duplicate entries. See the duplication note in
+      Section 4.
+
+---------------------------------------------------------------------
+  7. DEFAULT CLIENT SCOPE ASSIGNMENTS
+---------------------------------------------------------------------
+
+  defaultDefaultClientScopes : ["web-origins", "profile", "roles", "email"]
+    These four scopes are automatically attached to every client in the
+    realm unless explicitly removed. They are always included in tokens
+    without the client needing to request them:
+
+    web-origins
+      Adds the client's configured webOrigins to the CORS allowed-origins
+      list on Keycloak's token endpoints. Required for browser clients.
+
+    profile
+      Includes standard OpenID Connect user claims: name, given_name,
+      family_name, preferred_username, updated_at. The ID token carries
+      these claims; the access token may not include all of them depending
+      on Keycloak version. This is why the Angular app reads
+      preferred_username from idTokenParsed, not tokenParsed.
+
+    roles
+      The custom scope defined in Section 6. Including it here ensures
+      realm roles appear in tokens for every client without any per-client
+      mapper configuration.
+
+    email
+      Includes email and email_verified claims in tokens.
+
+  defaultOptionalClientScopes : ["offline_access", "address", "phone"]
+    These scopes are available but not included by default. A client
+    must explicitly request them as scope parameters.
+
+    offline_access
+      When requested, Keycloak issues an offline refresh token that
+      survives server restarts and does not expire until explicitly
+      revoked. Not used in this project's normal login flow.
+
+    address
+      Includes postal address claims (address, formatted, etc.).
+      Not used.
+
+    phone
+      Includes phone_number and phone_number_verified claims.
+      Not used.
+
+---------------------------------------------------------------------
+  8. DECODED JWT ANATOMY
+---------------------------------------------------------------------
+
+  What a valid access token looks like for user1 after login:
+
+  Header:
+    {
+      "alg": "RS256",
+      "typ": "JWT",
+      "kid": "<realm-signing-key-id>"
+    }
+
+  Payload (key claims only):
+    {
+      "exp": <now + 300>,
+      "iat": <now>,
+      "jti": "<unique-token-id>",
+      "iss": "http://localhost:8080/realms/myapp-realm",
+      "aud": "account",
+      "sub": "<user1-uuid>",
+      "typ": "Bearer",
+      "azp": "angular-client",
+      "session_state": "<session-uuid>",
+      "preferred_username": "user1",
+      "email": "user1@myapp.com",
+      "email_verified": true,
+      "name": "Regular User",
+      "given_name": "Regular",
+      "family_name": "User",
+      "roles": ["ROLE_USER"]       ← written by the realm-roles-mapper
+    }
+
+  What a client_credentials token looks like for order-service:
+
+  Payload (key claims only):
+    {
+      "exp": <now + 300>,
+      "iat": <now>,
+      "iss": "http://localhost:8080/realms/myapp-realm",
+      "sub": "<service-account-uuid>",
+      "typ": "Bearer",
+      "azp": "order-service-client",
+      "preferred_username": "service-account-order-service-client",
+      "roles": ["ROLE_USER", "ROLE_ADMIN"]  ← from service account roles
+    }
+
+  Spring Boot's SecurityConfig.java extracts roles like this:
+    List<String> roles = jwt.getClaimAsStringList("roles");
+    // → ["ROLE_USER"] for user1
+    // → ["ROLE_USER", "ROLE_ADMIN"] for admin1 / order-service tokens
+
+---------------------------------------------------------------------
+  9. IMPORT MECHANISM
+---------------------------------------------------------------------
+
+  HOW IT WORKS:
+    Keycloak reads this file at startup when the container is launched
+    with the command argument "--import-realm". In Docker Compose the
+    file is bind-mounted into the container at the path
+    /opt/keycloak/data/import/realm-export.json.
+
+  IDEMPOTENCY:
+    If the realm "myapp-realm" already exists (e.g. after a container
+    restart), Keycloak skips the import and leaves the existing realm
+    unchanged. The import only runs if the realm does not exist. This
+    means:
+      - Stopping and restarting the container does NOT reset the realm.
+      - To force a re-import, the keycloak-db volume must be dropped
+        first: docker compose down -v && docker compose up --build -d
+
+  WHAT IS NOT IN THE EXPORT:
+    - Keycloak's own admin user (admin / Admin@1234!) — this is created
+      by the KEYCLOAK_ADMIN and KEYCLOAK_ADMIN_PASSWORD env vars, not
+      by the realm export.
+    - SMTP server settings for email delivery (reset password, verify).
+    - Theme customisations, localization overrides.
+    - Token introspection endpoint settings.
+    - Realm-level brute-force thresholds (only the enabled flag is here;
+      the numeric thresholds use Keycloak defaults).
+    - The actual RSA signing key pair (generated by Keycloak at first
+      start and stored in the database).
+
+---------------------------------------------------------------------
+  10. SECURITY NOTES & PRODUCTION CHECKLIST
+---------------------------------------------------------------------
+
+  The current realm-export.json is configured for local development.
+  Before any production deployment the following fields must be reviewed:
+
+  sslRequired: "none"
+    → Change to "external" or "all". Without SSL enforcement, tokens
+      travel in plain text over HTTP.
+
+  directAccessGrantsEnabled: true  (on angular-client)
+    → Set to false. The Resource Owner Password Credentials grant
+      bypasses PKCE and is a target for credential stuffing attacks.
+      Authorization Code + PKCE is sufficient for the Angular SPA.
+
+  secrets in the export (angular-client has no secret; api-gateway
+    and order-service-client have placeholder secrets)
+    → Replace "api-gateway-secret" and "order-service-secret" with
+      strong randomly generated values. In Docker Compose these come
+      from .env; in Kubernetes from k8s/01-secrets.yaml. The export
+      values only apply during the first --import-realm pass.
+
+  accessTokenLifespan: 300 (5 minutes)
+    → Acceptable for production. Shorter is better for security;
+      longer reduces Keycloak load from refresh requests.
+
+  bruteForceProtected: true
+    → Already enabled. Configure numeric thresholds in the Admin
+      Console (failure count, wait increment, max wait, quick login
+      check) for your threat model.
+
+  registrationAllowed: false
+    → Correct for an internal application. Do not enable self-
+      registration without adding email verification and CAPTCHA.
+
+  resetPasswordAllowed: true
+    → Requires SMTP configuration in the Admin Console for the reset
+      email to be delivered. Without SMTP the "Forgot password?" link
+      is visible but the email never arrives.
+
+=====================================================================
+=====================================================================
