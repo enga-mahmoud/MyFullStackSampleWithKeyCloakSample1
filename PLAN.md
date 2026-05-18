@@ -86,7 +86,10 @@ MyFullStackSampleWithKeyCloackSample1/
 │   ├── tempo/tempo.yaml
 │   └── grafana/provisioning/
 │       ├── datasources/datasources.yaml
-│       └── dashboards/dashboards.yaml
+│       └── dashboards/
+│           ├── dashboards.yaml             # Provider — scans folder for JSON files
+│           ├── logs.json                   # "Service Logs" dashboard (Loki)
+│           └── spring-boot.json            # "Spring Boot Services" dashboard (Prometheus)
 │
 ├── config-server/                          # Spring Cloud Config Server (:8888)
 ├── api-gateway/                            # Spring Cloud Gateway (:8090)
@@ -305,9 +308,18 @@ POST /api/orders (user Bearer JWT) → API Gateway → order-service
 
 | Signal | Producer | Transport | Storage | Visualization |
 |---|---|---|---|---|
-| Metrics | Spring Actuator `/actuator/prometheus` | Prometheus scrape (pull) | Prometheus TSDB | Grafana |
-| Traces | Micrometer OTel bridge | OTel Collector gRPC (push) | Tempo | Grafana |
-| Logs | Loki Logback Appender | HTTP push to Loki | Loki chunks | Grafana |
+| Metrics (app) | Spring Actuator `/actuator/prometheus` | Prometheus scrape (pull) | Prometheus TSDB | Grafana — "Spring Boot Services" dashboard |
+| Metrics (spans) | OTel Collector metrics generator | Remote write (push) | Prometheus TSDB | Grafana — Service Map |
+| Traces | Micrometer OTel bridge | OTel Collector gRPC (push) | Tempo | Grafana — Explore → Tempo |
+| Logs | Loki Logback Appender (loki4j) | HTTP push `/loki/api/v1/push` | Loki chunks | Grafana — "Service Logs" dashboard |
+
+**Prometheus remote write**: Prometheus runs with `--web.enable-remote-write-receiver`
+so the OTel Collector can push span-derived metrics (service graph, span metrics)
+alongside the regular pull-based scrape of `/actuator/prometheus`.
+
+**Pre-provisioned dashboards** (Dashboards → MyApp folder in Grafana):
+- **Service Logs** (`logs.json`) — Loki log viewer with service + level filters, volume chart, live log panel
+- **Spring Boot Services** (`spring-boot.json`) — JVM heap/CPU/threads, HTTP rate/latency/errors, GC pauses, HikariCP pool
 
 **Cross-signal correlation** (all wired in Grafana datasources):
 - Log line traceId → jump to Tempo trace

@@ -1108,6 +1108,10 @@ infrastructure/prometheus/prometheus.yml
     - Prometheus pulls (scrapes) from these targets on its interval and
       stores the time-series data in its local TSDB, from which Grafana
       reads for dashboard visualisation.
+  NOTE : Prometheus is started with --web.enable-remote-write-receiver
+    (set in docker-compose.yml command) so the OTel Collector can push
+    span-derived metrics (service graph, span metrics) via the
+    prometheusremotewrite exporter in addition to the regular scrape path.
 
 ---------------------------------------------------------------------
   infrastructure/loki/
@@ -1136,8 +1140,8 @@ infrastructure/tempo/tempo.yaml
   WHAT IT DOES :
     - Binds the HTTP API to port 3100 (exposed as 3110 on the host to
       avoid conflict with Loki's 3100).
-    - Enables OTLP receivers (gRPC and HTTP) so the OTel Collector can
-      forward traces to Tempo.
+    - Enables OTLP receivers (gRPC on port 4317, HTTP on port 4318) in the
+      distributor so the OTel Collector can forward traces to Tempo.
     - Configures local filesystem storage for trace data and WAL
       (Write-Ahead Log for durability).
     - Configures the metrics generator:
@@ -1145,7 +1149,11 @@ infrastructure/tempo/tempo.yaml
           latencies between services) and span metrics from trace data.
         * Remote-writes these derived metrics to Prometheus, enabling
           the "Service Map" view in Grafana.
-    - Sets block retention to 48h (traces older than 2 days are deleted).
+  NOTE : The top-level ingester and compactor blocks are intentionally
+    absent. In Tempo's monolithic mode (the default for grafana/tempo:latest
+    v2.x), these are not valid top-level config fields — they caused Tempo
+    to crash-loop on startup. Block retention and ingester tuning use
+    Tempo's built-in defaults in monolithic mode.
 
 ---------------------------------------------------------------------
   infrastructure/grafana/provisioning/
@@ -1175,6 +1183,38 @@ infrastructure/grafana/provisioning/dashboards/dashboards.yaml
       folder automatically on startup.
     - Any dashboard JSON file placed in infrastructure/grafana/provisioning/
       dashboards/ will be available in Grafana without manual import.
+
+infrastructure/grafana/provisioning/dashboards/logs.json
+  PURPOSE : Pre-provisioned Grafana dashboard for viewing service logs from Loki.
+  WHAT IT DOES :
+    - Automatically available in Grafana under Dashboards → MyApp → "Service Logs".
+    - Provides a "Service" template variable (populated from Loki's app label)
+      and a "Level" variable (DEBUG / INFO / WARN / ERROR / All) to filter
+      log streams without editing queries.
+    - Panel 1 — Log Volume (timeseries): count_over_time per app+level
+      so you can see error spikes at a glance.
+    - Panel 2 — Logs (log panel): live scrolling log view, sortable newest-
+      first, with label display, log detail expansion, and trace-link
+      derivation (clickable traceId → Tempo trace).
+
+infrastructure/grafana/provisioning/dashboards/spring-boot.json
+  PURPOSE : Pre-provisioned Grafana dashboard for Spring Boot service metrics from Prometheus.
+  WHAT IT DOES :
+    - Automatically available in Grafana under Dashboards → MyApp → "Spring Boot Services".
+    - Provides a multi-select "Service" template variable (populated from
+      the Prometheus job label on jvm_memory_used_bytes) to compare
+      services side by side or drill into one.
+    - Panels (all filterable by the Service variable):
+        * JVM Heap Memory — used vs max bytes (detect memory pressure).
+        * CPU Usage — process_cpu_usage per service.
+        * HTTP Request Rate — rate(http_server_requests_seconds_count[2m])
+          broken down by URI and status, excluding actuator endpoints.
+        * HTTP 5xx Error Rate — isolates server-side errors.
+        * HTTP Request Latency — p50 and p95 via histogram_quantile.
+        * JVM Threads — live and daemon thread counts.
+        * GC Pause Time — increase in gc pause seconds per 2m window.
+        * Database Connection Pool — HikariCP active, pending, and total
+          connections (from hikaricp_connections_* metrics).
 
 
 =====================================================================
@@ -1546,9 +1586,9 @@ frontend/src/app/pages/admin/admin.component.ts
       does not break the whole page).
     - Displays stat cards: total users, total products, out-of-stock count,
       total orders.
-    - Provides quick-link buttons to: Keycloak Admin Console, Grafana,
-      Prometheus, Config Server actuator, API Gateway routes actuator,
-      Order Service actuator health.
+    - Provides quick-link buttons to: Keycloak Admin Console (:8080),
+      Grafana (:3001), Prometheus (:9091), Config Server actuator (:8888),
+      API Gateway routes actuator (:8090), Order Service actuator health (:8083).
     - Lists all backend services with their ports for quick reference,
       including order-service on :8083.
 

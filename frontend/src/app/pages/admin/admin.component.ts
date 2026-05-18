@@ -34,8 +34,8 @@ import { catchError, forkJoin, of } from 'rxjs';
         <h3>Quick Links</h3>
         <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-top:1rem;">
           <a href="http://localhost:8080/admin" target="_blank" class="btn btn-primary">Keycloak Admin</a>
-          <a href="http://localhost:3000" target="_blank" class="btn btn-outline">Grafana</a>
-          <a href="http://localhost:9090" target="_blank" class="btn btn-outline">Prometheus</a>
+          <a href="http://localhost:3001" target="_blank" class="btn btn-outline">Grafana</a>
+          <a href="http://localhost:9091" target="_blank" class="btn btn-outline">Prometheus</a>
           <a href="http://localhost:8888/actuator" target="_blank" class="btn btn-outline">Config Server</a>
           <a href="http://localhost:8090/actuator/gateway/routes" target="_blank" class="btn btn-outline">Gateway Routes</a>
           <a href="http://localhost:8083/actuator/health" target="_blank" class="btn btn-outline">Order Service</a>
