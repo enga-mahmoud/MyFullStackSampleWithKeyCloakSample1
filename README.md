@@ -1379,7 +1379,8 @@ frontend/src/app/app.routes.ts
     - ** wildcard redirects unknown URLs back to /dashboard.
 
 frontend/src/app/interceptors/auth.interceptor.ts
-  PURPOSE : HTTP interceptor that attaches the Keycloak JWT to API requests.
+  PURPOSE : HTTP interceptor that attaches the Keycloak JWT to API requests
+            and redirects to the Keycloak login page on authentication failure.
   WHAT IT DOES :
     - Implements Angular's HttpInterceptorFn (functional interceptor, Angular 15+).
     - Skips requests that don't start with /api (e.g. Keycloak's own
@@ -1388,6 +1389,17 @@ frontend/src/app/interceptors/auth.interceptor.ts
       current access token (and silently refreshes it if expired).
     - Clones the request and adds Authorization: Bearer <token> header.
     - Returns the modified request to the HTTP pipeline.
+    - Catches errors from the pipeline with catchError and handles two
+      failure modes that both indicate the session has ended:
+        * HttpErrorResponse with status 401 — the API rejected the token
+          (access token expired, Keycloak session ended, or clock skew).
+        * Non-HttpErrorResponse error — keycloak.getToken() itself threw,
+          meaning both the access token and the refresh token are expired
+          so silent renewal is impossible.
+      In both cases calls keycloak.login({ redirectUri: window.location.href })
+      which immediately redirects the browser to the Keycloak login page.
+      After successful re-authentication Keycloak redirects back to the
+      exact URL the user was on before the session expired.
 
 frontend/src/app/guards/auth.guard.ts
   PURPOSE : Route guard that protects pages requiring authentication and roles.

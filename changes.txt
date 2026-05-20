@@ -1,0 +1,116 @@
+=====================================================================
+  CHANGES — Grafana Tempo Trace ID Not Found Fix
+  Date: 2026-05-20
+=====================================================================
+
+PROBLEM
+-------
+Searching for a trace ID in Grafana Tempo returned no results.
+Three root causes were identified and fixed.
+
+
+=====================================================================
+  CHANGE 1 — config-repo/application.yml
+=====================================================================
+
+WHAT CHANGED:
+  Added management.otlp.tracing.endpoint under the management block.
+
+BEFORE:
+  management:
+    ...
+    tracing:
+      sampling:
+        probability: 1.0
+
+AFTER:
+  management:
+    ...
+    tracing:
+      sampling:
+        probability: 1.0
+    otlp:
+      tracing:
+        endpoint: ${MANAGEMENT_OTLP_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+
+WHY:
+  Spring Boot 3.x auto-configuration creates an OtlpHttpSpanExporter and
+  reads its destination from management.otlp.tracing.endpoint — NOT from
+  otel.exporter.otlp.endpoint (which the services had in application.yml)
+  and NOT from the OTEL_EXPORTER_OTLP_ENDPOINT env var (which is an OTel
+  SDK env var, not a Spring Boot property).
+
+  Without this property, all services silently fell back to the Spring Boot
+  default: http://localhost:4318/v1/traces — which is a dead end inside
+  every Docker container. Traces were generated (trace IDs appeared in logs)
+  but nothing was ever exported to the OTel Collector.
+
+
+=====================================================================
+  CHANGE 2 — docker-compose.yml
+=====================================================================
+
+WHAT CHANGED:
+  Added MANAGEMENT_OTLP_TRACING_ENDPOINT env var to four services:
+  api-gateway, user-service, product-service, order-service.
+
+ADDED LINE (same in all four services):
+  MANAGEMENT_OTLP_TRACING_ENDPOINT: http://otel-collector:4318/v1/traces
+
+WHY:
+  The Docker-internal hostname "otel-collector" is only resolvable inside
+  the Docker bridge network — it cannot be hardcoded in config-repo because
+  that config is also used for local development (outside Docker) where the
+  hostname does not resolve.
+
+  Port 4318 is used (not 4317) because Spring Boot's auto-config creates
+  an OtlpHttpSpanExporter (HTTP/protobuf transport). Port 4317 is gRPC-only
+  and cannot accept HTTP connections. The OTel Collector listens on both
+  4317 (gRPC) and 4318 (HTTP), so 4318 is the correct target.
+
+  The existing OTEL_EXPORTER_OTLP_ENDPOINT env var was kept but it has no
+  effect on Spring Boot's auto-configuration.
+
+
+=====================================================================
+  CHANGE 3 — infrastructure/grafana/provisioning/datasources/datasources.yaml
+=====================================================================
+
+WHAT CHANGED:
+  Fixed the Loki derived field matcherRegex.
+
+BEFORE:
+  matcherRegex: '"traceId":"(\w+)"'
+
+AFTER:
+  matcherRegex: '\[[\w-]+,(\w+),'
+
+WHY:
+  The old regex expected a JSON log format: {"traceId":"abc123",...}
+  The Logback configuration in logback-spring.xml produces plain-text lines:
+    2024-01-01 10:00:00  INFO [user-service,abc123def456,abcdef] ...
+
+  The old regex never matched, so the clickable "TraceID" link that should
+  appear on Loki log lines (to jump directly to the trace in Tempo) was
+  never rendered.
+
+  The new regex '\[[\w-]+,(\w+),' matches the plain-text [appName,traceId,
+  spanId] bracket group and correctly captures the traceId in group 1.
+
+
+=====================================================================
+  CHANGE 4 — docs.txt
+=====================================================================
+
+WHAT CHANGED:
+  Updated documentation for all four files above.
+  Updated the OBSERVABILITY FLOW summary section.
+
+SECTIONS UPDATED:
+  - docker-compose.yml entry
+  - config-repo/application.yml entry
+  - infrastructure/tempo/tempo.yaml entry
+  - infrastructure/grafana/provisioning/datasources/datasources.yaml entry
+  - OBSERVABILITY FLOW (in the SUMMARY section)
+
+=====================================================================

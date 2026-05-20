@@ -238,6 +238,7 @@ services:
       KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/myapp-realm
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/certs
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      MANAGEMENT_OTLP_TRACING_ENDPOINT: http://otel-collector:4318/v1/traces
     ports:
       - "8090:8090"
     depends_on:
@@ -267,6 +268,7 @@ services:
       KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/myapp-realm
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/certs
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      MANAGEMENT_OTLP_TRACING_ENDPOINT: http://otel-collector:4318/v1/traces
       LOKI_URL: http://loki:3100
     ports:
       - "8081:8081"
@@ -299,6 +301,7 @@ services:
       KEYCLOAK_ISSUER_URI: http://localhost:8080/realms/myapp-realm
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/myapp-realm/protocol/openid-connect/certs
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      MANAGEMENT_OTLP_TRACING_ENDPOINT: http://otel-collector:4318/v1/traces
       LOKI_URL: http://loki:3100
     ports:
       - "8082:8082"
@@ -335,6 +338,7 @@ services:
       USER_SERVICE_URL: http://user-service:8081
       PRODUCT_SERVICE_URL: http://product-service:8082
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      MANAGEMENT_OTLP_TRACING_ENDPOINT: http://otel-collector:4318/v1/traces
       LOKI_URL: http://loki:3100
     ports:
       - "8083:8083"

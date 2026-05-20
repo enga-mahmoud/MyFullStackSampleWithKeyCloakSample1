@@ -39,6 +39,14 @@ docker-compose.yml
       JWT issuer). This split bypasses Keycloak's OIDC discovery document
       (which contains localhost URLs unreachable from inside containers)
       while still validating the iss claim in every JWT.
+    - All Spring Boot services (api-gateway, user-service, product-service,
+      order-service) receive MANAGEMENT_OTLP_TRACING_ENDPOINT set to
+      http://otel-collector:4318/v1/traces. This is the Spring Boot 3.x
+      property (via its env-var form) that routes OtlpHttpSpanExporter to
+      the OTel Collector's HTTP port (4318). Port 4317 is gRPC-only and
+      cannot be used with the HTTP exporter Spring Boot creates by default.
+      The older OTEL_EXPORTER_OTLP_ENDPOINT env var is kept for reference
+      but is not read by Spring Boot's auto-configuration.
 
 .env
   PURPOSE : Central store for all secrets and configurable values used
@@ -98,6 +106,13 @@ config-repo/application.yml
     - Defines the logging pattern that injects traceId and spanId into
       every log line, enabling log-to-trace correlation in Grafana.
     - Enables DEBUG logging for com.myapp packages.
+    - Sets management.otlp.tracing.endpoint from the env var
+      MANAGEMENT_OTLP_TRACING_ENDPOINT (default: http://localhost:4318/v1/traces).
+      This is the Spring Boot 3.x property that controls where the
+      OtlpHttpSpanExporter sends traces. It is different from the OTel SDK
+      env var OTEL_EXPORTER_OTLP_ENDPOINT, which Spring Boot's auto-config
+      does NOT read. Without this property, traces silently fall back to
+      http://localhost:4318/v1/traces (dead end inside every container).
 
 config-repo/user-service.yml
   PURPOSE : Overrides and additions specific to the user-service only.
@@ -1150,10 +1165,11 @@ infrastructure/tempo/tempo.yaml
         * Remote-writes these derived metrics to Prometheus, enabling
           the "Service Map" view in Grafana.
   NOTE : The top-level ingester and compactor blocks are intentionally
-    absent. In Tempo's monolithic mode (the default for grafana/tempo:latest
-    v2.x), these are not valid top-level config fields — they caused Tempo
-    to crash-loop on startup. Block retention and ingester tuning use
-    Tempo's built-in defaults in monolithic mode.
+    absent. In Tempo's monolithic mode (the default for grafana/tempo:latest),
+    these are not valid top-level config fields in app.Config — adding them
+    causes Tempo to crash-loop on startup with "field ingester not found in
+    type app.Config". Block retention and ingester tuning use Tempo's
+    built-in defaults in monolithic mode.
 
 ---------------------------------------------------------------------
   infrastructure/grafana/provisioning/
@@ -1168,6 +1184,9 @@ infrastructure/grafana/provisioning/datasources/datasources.yaml
       that detects traceId values in log lines and creates clickable
       links to the corresponding Tempo trace — enabling one-click
       navigation from a log entry to its distributed trace.
+      The matcherRegex '\[[\w-]+,(\w+),' matches the plain-text Logback
+      format [appName,traceId,spanId] produced by logback-spring.xml.
+      (A JSON-format regex like "traceId":"(\w+)" would not match.)
     - Provisions Tempo (for traces) with:
         * Trace-to-logs linkage pointing to Loki (so clicking a trace
           span shows the logs from that time window).
@@ -1639,12 +1658,17 @@ ORDER PLACEMENT FLOW (service-to-service):
 
 OBSERVABILITY FLOW:
   - Every Spring Boot service creates a trace span per HTTP request.
-  - Micrometer OTel bridge sends spans via gRPC to otel-collector:4317.
-  - OTel Collector batches and forwards spans to Tempo.
+  - Spring Boot's OtlpHttpSpanExporter (configured via
+    management.otlp.tracing.endpoint) sends spans over HTTP to
+    otel-collector:4318/v1/traces. Port 4318 is the OTLP HTTP port;
+    port 4317 is gRPC-only and cannot be used with the HTTP exporter.
+  - OTel Collector batches and forwards spans to Tempo via gRPC (tempo:4317).
   - Micrometer exposes /actuator/prometheus; Prometheus scrapes it every 15s.
   - Loki Logback Appender pushes log batches directly to Loki:3100.
   - Grafana queries all three backends; Datasource config enables
     cross-navigation: click a log line → jump to its trace in Tempo.
+    Loki's derived field regex '\[[\w-]+,(\w+),' extracts the traceId from
+    Logback's plain-text [appName,traceId,spanId] log format.
 
 CONFIGURATION FLOW:
   - Config Server starts and mounts config-repo/ as a volume.

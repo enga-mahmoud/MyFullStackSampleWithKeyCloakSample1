@@ -10,6 +10,9 @@ distributor:
         http:
           endpoint: 0.0.0.0:4318
 
+live_store:
+  max_block_duration: 2m
+
 storage:
   trace:
     backend: local
