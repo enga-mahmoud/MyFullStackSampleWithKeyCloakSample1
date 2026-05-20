@@ -6,7 +6,7 @@
 PROBLEM
 -------
 Searching for a trace ID in Grafana Tempo returned no results.
-Three root causes were identified and fixed.
+Four root causes were identified and fixed.
 
 
 =====================================================================
@@ -73,7 +73,42 @@ WHY:
 
 
 =====================================================================
-  CHANGE 3 — infrastructure/grafana/provisioning/datasources/datasources.yaml
+  CHANGE 3 — infrastructure/tempo/tempo.yaml
+=====================================================================
+
+WHAT CHANGED:
+  Added live_store block before the storage section.
+
+BEFORE:
+  storage:
+    trace:
+      ...
+
+AFTER:
+  live_store:
+    max_block_duration: 2m
+
+  storage:
+    trace:
+      ...
+
+WHY:
+  In Tempo v3.x (grafana/tempo:latest = v3.0.0-rc.1), the old ingester
+  block is no longer a valid top-level config field and causes a crash-loop:
+    "failed parsing config: field ingester not found in type app.Config"
+
+  The replacement is the live_store block. The default max_block_duration
+  in Tempo v3.x is ~13 minutes — meaning traces sit in the WAL and are
+  invisible to Grafana search for up to 13 minutes after being received.
+  Setting max_block_duration: 2m causes the WAL to flush and become
+  queryable within 2 minutes.
+
+  NOTE: ingester is the v2.x key; live_store is the v3.x key.
+  Using ingester on v3.x causes Tempo to fail at startup.
+
+
+=====================================================================
+  CHANGE 5 — infrastructure/grafana/provisioning/datasources/datasources.yaml
 =====================================================================
 
 WHAT CHANGED:
@@ -99,7 +134,7 @@ WHY:
 
 
 =====================================================================
-  CHANGE 4 — docs.txt
+  CHANGE 6 — docs.txt
 =====================================================================
 
 WHAT CHANGED:

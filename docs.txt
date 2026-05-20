@@ -1157,6 +1157,13 @@ infrastructure/tempo/tempo.yaml
       avoid conflict with Loki's 3100).
     - Enables OTLP receivers (gRPC on port 4317, HTTP on port 4318) in the
       distributor so the OTel Collector can forward traces to Tempo.
+    - Sets live_store.max_block_duration: 2m — forces the live store to
+      cut and flush its WAL block every 2 minutes. Without this, the
+      default flush interval in Tempo v3.x is ~13 minutes, meaning traces
+      would not appear in Grafana search for up to 13 minutes after being
+      received. The live_store block is the Tempo v3.x replacement for the
+      old ingester block (which is no longer a valid top-level config key
+      in v3.x and causes a crash-loop if added).
     - Configures local filesystem storage for trace data and WAL
       (Write-Ahead Log for durability).
     - Configures the metrics generator:
@@ -1164,12 +1171,10 @@ infrastructure/tempo/tempo.yaml
           latencies between services) and span metrics from trace data.
         * Remote-writes these derived metrics to Prometheus, enabling
           the "Service Map" view in Grafana.
-  NOTE : The top-level ingester and compactor blocks are intentionally
-    absent. In Tempo's monolithic mode (the default for grafana/tempo:latest),
-    these are not valid top-level config fields in app.Config — adding them
-    causes Tempo to crash-loop on startup with "field ingester not found in
-    type app.Config". Block retention and ingester tuning use Tempo's
-    built-in defaults in monolithic mode.
+  NOTE : grafana/tempo:latest resolves to v3.0.0-rc.1 at the time of
+    writing. The top-level ingester block used in Tempo v2.x is NOT valid
+    in v3.x — it causes a crash-loop with "field ingester not found in
+    type app.Config". Use live_store instead (see above).
 
 ---------------------------------------------------------------------
   infrastructure/grafana/provisioning/
